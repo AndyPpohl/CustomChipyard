@@ -1,0 +1,23 @@
+[0m[[0m[33mwarn[0m] [0m[0m/home/andy/chipyard/generators/gemmini/src/main/scala/gemmini/Configs.scala:294:21: value LazyModule in package diplomacy is deprecated (since rocketchip 2.0.0): Diplomacy has been split to a standalone library[0m
+[0m[[0m[33mwarn[0m] [0m[0m      val gemmini = LazyModule(new Gemmini(gemminiConfig))[0m
+[0m[[0m[33mwarn[0m] [0m[0m                    ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/andy/chipyard/generators/gemmini/src/main/scala/gemmini/Configs.scala:309:21: value LazyModule in package diplomacy is deprecated (since rocketchip 2.0.0): Diplomacy has been split to a standalone library[0m
+[0m[[0m[33mwarn[0m] [0m[0m      val gemmini = LazyModule(new Gemmini(gemminiConfig))[0m
+[0m[[0m[33mwarn[0m] [0m[0m                    ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/andy/chipyard/generators/gemmini/src/main/scala/gemmini/Configs.scala:321:21: value LazyModule in package diplomacy is deprecated (since rocketchip 2.0.0): Diplomacy has been split to a standalone library[0m
+[0m[[0m[33mwarn[0m] [0m[0m      val gemmini = LazyModule(new Gemmini(gemminiConfig))[0m
+[0m[[0m[33mwarn[0m] [0m[0m                    ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/andy/chipyard/generators/gemmini/src/main/scala/gemmini/Configs.scala:333:21: value LazyModule in package diplomacy is deprecated (since rocketchip 2.0.0): Diplomacy has been split to a standalone library[0m
+[0m[[0m[33mwarn[0m] [0m[0m      val gemmini = LazyModule(new Gemmini(gemminiConfig))[0m
+[0m[[0m[33mwarn[0m] [0m[0m                    ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/andy/chipyard/generators/gemmini/src/main/scala/gemmini/Configs.scala:347:21: value LazyModule in package diplomacy is deprecated (since rocketchip 2.0.0): Diplomacy has been split to a standalone library[0m
+[0m[[0m[33mwarn[0m] [0m[0m      int_gemmini = LazyModule(new Gemmini(GemminiConfigs.chipConfig.copy([0m
+[0m[[0m[33mwarn[0m] [0m[0m                    ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/andy/chipyard/generators/gemmini/src/main/scala/gemmini/Configs.scala:356:20: value LazyModule in package diplomacy is deprecated (since rocketchip 2.0.0): Diplomacy has been split to a standalone library[0m
+[0m[[0m[33mwarn[0m] [0m[0m      fp_gemmini = LazyModule(new Gemmini(GemminiFPConfigs.BF16DefaultConfig.copy([0m
+[0m[[0m[33mwarn[0m] [0m[0m                   ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/andy/chipyard/generators/gemmini/src/main/scala/gemmini/Configs.scala:372:7: value InModuleBody in package diplomacy is deprecated (since rocketchip 2.0.0): Diplomacy has been split to a standalone library[0m
+[0m[[0m[33mwarn[0m] [0m[0m      InModuleBody {[0m
+[0m[[0m[33mwarn[0m] [0m[0m      ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m2 feature warnings; re-run with -feature for details[0m
+[0m[[0m[33mwarn[0m] [0m[0m8 warnings found[0m

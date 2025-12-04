@@ -1,0 +1,573 @@
+
+class ScratchpadMemReadRequest[U <: Data](local_addr_t: LocalAddr, scale_t_bits: Int)(implicit p: Parameters) extends CoreBundle {
+  val vaddr = UInt(coreMaxAddrBits.W)
+  val laddr = local_addr_t.cloneType
+
+  val cols = UInt(16.W) // TODO don't use a magic number for the width here
+  val repeats = UInt(16.W) // TODO don't use a magic number for the width here
+  val scale = UInt(scale_t_bits.W)
+  val has_acc_bitwidth = Bool()
+  val all_zeros = Bool()
+  val block_stride = UInt(16.W) // TODO magic numbers
+  val pixel_repeats = UInt(8.W) // TODO magic numbers
+  val cmd_id = UInt(8.W) // TODO don't use a magic number here
+  val status = new MStatus
+
+}
+
+class ScratchpadMemWriteRequest(local_addr_t: LocalAddr, acc_t_bits: Int, scale_t_bits: Int)
+                              (implicit p: Parameters) extends CoreBundle {
+  val vaddr = UInt(coreMaxAddrBits.W)
+  val laddr = local_addr_t.cloneType
+
+  val dest = UInt(1.W)
+
+  val acc_act = UInt(Activation.bitwidth.W) // TODO don't use a magic number for the width here
+  val acc_scale = UInt(scale_t_bits.W)
+  val acc_igelu_qb = UInt(acc_t_bits.W)
+  val acc_igelu_qc = UInt(acc_t_bits.W)
+  val acc_iexp_qln2 = UInt(acc_t_bits.W)
+  val acc_iexp_qln2_inv = UInt(acc_t_bits.W)
+  val acc_norm_stats_id = UInt(8.W) // TODO magic number
+
+  val len = UInt(16.W) // TODO don't use a magic number for the width here
+  val block = UInt(8.W) // TODO don't use a magic number for the width here
+
+  val cmd_id = UInt(8.W) // TODO don't use a magic number here
+  val status = new MStatus
+
+  // Pooling variables
+  val pool_en = Bool()
+  val store_en = Bool()
+
+}
+
+
+class ScratchpadReadReq(val n: Int) extends Bundle {
+  val addr = UInt(log2Ceil(n).W)
+  val fromDMA = Bool()
+}
+
+class ScratchpadReadResp(val w: Int) extends Bundle {
+  val data = UInt(w.W)
+  val fromDMA = Bool()
+}
+
+class ScratchpadReadIO(val n: Int, val w: Int) extends Bundle {
+  val req = Decoupled(new ScratchpadReadReq(n))
+  val resp = Flipped(Decoupled(new ScratchpadReadResp(w)))
+}
+
+
+class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, use_shared_ext_mem: Boolean, is_dummy: Boolean) extends Module {
+  // This is essentially a pipelined SRAM with the ability to stall pipeline stages
+
+  require(w % aligned_to == 0 || w < aligned_to)
+  val mask_len = (w / (aligned_to * 8)) max 1 // How many mask bits are there?
+  val mask_elem = UInt((w min (aligned_to * 8)).W) // What datatype does each mask bit correspond to?
+
+  val io = IO(new Bundle {
+    val read = Flipped(new ScratchpadReadIO(n, w))
+    val write = Flipped(new ScratchpadWriteIO(n, w, mask_len))
+    val ext_mem = if (use_shared_ext_mem) Some(new ExtMemIO) else None
+  })
+
+  val ren = io.read.req.fire
+  val fromDMA = io.read.req.bits.fromDMA
+
+  // Make a queue which buffers the result of an SRAM read if it can't immediately be consumed
+  val q = Module(new Queue(new ScratchpadReadResp(w), 1, true, true))
+  val q_will_be_empty = (q.io.count +& q.io.enq.fire) - q.io.deq.fire === 0.U
+  // When the scratchpad is single-ported, the writes take precedence
+  val singleport_busy_with_write = single_ported.B && io.write.fire
+
+  if (is_dummy) {
+    q.io.enq.valid := RegNext(ren)
+    q.io.enq.bits.data := 0.U
+    q.io.enq.bits.fromDMA := RegNext(fromDMA)
+    io.read.req.ready := q_will_be_empty && !singleport_busy_with_write
+  } else if (use_shared_ext_mem) { // use ready-valid interface
+    val ext_mem = io.ext_mem.get
+
+    /* READ */
+    ext_mem.read_req.valid := q_will_be_empty && io.read.req.valid
+    ext_mem.read_req.bits := io.read.req.bits.addr
+    io.read.req.ready := q_will_be_empty && ext_mem.read_req.ready
+
+    // TODO (richard): the number of entries here should be configurable
+    val dma_q = Module(new Queue(Bool(), 4, false, true))
+    dma_q.io.enq.valid := ren
+    dma_q.io.enq.bits := fromDMA
+    dma_q.io.deq.ready := q.io.enq.fire
+    assert(dma_q.io.enq.fire === ren, "DMA queue does not have enough entries") // TODO (richard): do backpressure
+    assert(dma_q.io.deq.fire === q.io.enq.fire, "fromDMA should be dequeued only when read resp comes back")
+
+    q.io.enq.valid := ext_mem.read_resp.valid
+    q.io.enq.bits.data := ext_mem.read_resp.bits
+    q.io.enq.bits.fromDMA := dma_q.io.deq.bits
+    ext_mem.read_resp.ready := q.io.enq.ready
+
+    /* WRITE */
+    val wq = Module(new Queue(ext_mem.write_req.bits.cloneType, 4, pipe=true, flow=true))
+    ext_mem.write_req <> wq.io.deq
+
+    wq.io.enq.valid := io.write.valid
+    io.write.ready := wq.io.enq.ready
+    wq.io.enq.bits.addr := io.write.addr
+    wq.io.enq.bits.data := io.write.data
+    if (aligned_to >= w) {
+      wq.io.enq.bits.mask := VecInit((~(0.U(mask_len.W))).asBools).asUInt
+    } else {
+      wq.io.enq.bits.mask := io.write.mask.asUInt
+    }
+    // assert(wq.io.enq.ready || (!io.write.en), "TODO (richard): fix this if triggered")
+  } else { // use valid only interface
+    val mem = SyncReadMem(n, Vec(mask_len, mask_elem))
+    //this SyncReadMem is what I actually want to replace
+    //
+
+
+    val raddr = io.read.req.bits.addr
+    val rdata = if (single_ported) {
+      assert(!(ren && io.write.fire))
+      mem.read(raddr, ren && !io.write.fire).asUInt
+    } else {
+      mem.read(raddr, ren).asUInt
+    }
+    q.io.enq.valid := RegNext(ren)
+    q.io.enq.bits.data := rdata
+    q.io.enq.bits.fromDMA := RegNext(fromDMA)
+
+    io.read.req.ready := q_will_be_empty && !singleport_busy_with_write
+
+    io.write.ready := true.B
+    when(io.write.fire) {
+      if (aligned_to >= w)
+        mem.write(io.write.addr, io.write.data.asTypeOf(Vec(mask_len, mask_elem)), VecInit((~(0.U(mask_len.W))).asBools))
+      else
+        mem.write(io.write.addr, io.write.data.asTypeOf(Vec(mask_len, mask_elem)), io.write.mask)
+    }
+  }
+
+  io.read.resp <> q.io.deq
+}
+
+
+class GatedDiodeMem(val n: Int, val w: Int,
+                    val readLatency: Int = 3,
+                    val writeLatency: Int = 2,
+                    val destructiveRead: Boolean = true)
+  extends Module {
+
+  val io = IO(new Bundle {
+    val raddr = Input(UInt(log2Ceil(n).W))
+    val ren   = Input(Bool())
+    val rvalid = Output(Bool())
+    val rdata  = Output(UInt(w.W))
+
+    val waddr = Input(UInt(log2Ceil(n).W))
+    val wen   = Input(Bool())
+    val wdata = Input(UInt(w.W))
+    val wready = Output(Bool())
+
+    val busy = Output(Bool())
+  })
+
+  // Underlying storage (still a vector of registers for simulation)
+  val mem = Reg(Vec(n, UInt(w.W)))
+
+  // Internal busy flag for multi-cycle ops
+  val (idle :: reading :: writing :: Nil) = Enum(3)
+  val state = RegInit(idle)
+
+  val readCounter  = Reg(UInt(8.W))
+  val writeCounter = Reg(UInt(8.W))
+
+  val readAddrReg  = Reg(UInt(log2Ceil(n).W))
+  val readDataReg  = Reg(UInt(w.W))
+
+  io.rdata := readDataReg
+  io.rvalid := false.B
+  io.busy := state =/= idle
+  io.wready := (state === idle)
+
+  switch(state) {
+
+    // -------------------------
+    // IDLE: Accept new operations
+    // -------------------------
+    is(idle) {
+      when(io.ren) {
+        readAddrReg := io.raddr
+        readCounter := (readLatency - 1).U
+        state := reading
+      }
+      when(io.wen) {
+        mem(io.waddr) := io.wdata  // initiate write
+        writeCounter := (writeLatency - 1).U
+        state := writing
+      }
+    }
+
+    // -------------------------
+    // READING: multi-cycle read
+    // -------------------------
+    is(reading) {
+
+      when(readCounter === 0.U) {
+        // read completes
+        val data = mem(readAddrReg)
+        readDataReg := data
+        io.rvalid := true.B
+
+        when(destructiveRead) {
+          // destructive read -> restore value
+          mem(readAddrReg) := data
+        }
+
+        state := idle
+      }
+      .otherwise {
+        readCounter := readCounter - 1.U
+      }
+    }
+
+    // -------------------------
+    // WRITING: multi-cycle write
+    // -------------------------
+    is(writing) {
+      when(writeCounter === 0.U) {
+        state := idle
+      }.otherwise {
+        writeCounter := writeCounter - 1.U
+      }
+    }
+  }
+}
+
+
+class GatedDiodeMem(val n: Int, val w: Int) extends Module {
+  val io = IO(new Bundle {
+    // Requests
+    val ren    = Input(Bool())
+    val raddr  = Input(UInt(log2Ceil(n).W))
+
+    val wen    = Input(Bool())
+    val waddr  = Input(UInt(log2Ceil(n).W))
+    val wdata  = Input(UInt(w.W))
+
+    // Outputs
+    val rdata  = Output(UInt(w.W))
+    val rvalid = Output(Bool())
+    val busy   = Output(Bool())
+  })
+
+  // -----------------------------------------
+  // Internal storage (behavioral model only)
+  // -----------------------------------------
+  val mem = Reg(Vec(n, UInt(w.W)))
+
+  // FSM States
+  val sIdle     :: sPrecharge :: sActivate :: sSense :: sRestore :: sWriteCycle :: Nil = Enum(6)
+  val state = RegInit(sIdle)
+
+  val savedAddr  = Reg(UInt(log2Ceil(n).W))
+  val savedWrite = Reg(Bool())
+  val savedData  = Reg(UInt(w.W))
+
+  // Output defaults
+  io.rdata  := 0.U
+  io.rvalid := false.B
+  io.busy   := (state =/= sIdle)
+
+  // -----------------------------------------
+  // FSM Logic
+  // -----------------------------------------
+  switch(state) {
+
+    is(sIdle) {
+      when(io.ren) {
+        savedAddr := io.raddr
+        state := sPrecharge
+      }.elsewhen(io.wen) {
+        savedAddr := io.waddr
+        savedData := io.wdata
+        savedWrite := true.B
+        state := sWriteCycle
+      }
+    }
+
+    // READ PHASES
+    is(sPrecharge) {
+      // 1 cycle precharge
+      state := sActivate
+    }
+
+    is(sActivate) {
+      // 1 cycle wordline activation
+      state := sSense
+    }
+
+    is(sSense) {
+      // 1 cycle sensing
+      io.rdata := mem(savedAddr)
+      io.rvalid := true.B
+
+      // destructive read? If so, clear or corrupt cell
+      // mem(savedAddr) := 0.U    // uncomment if needed
+
+      state := sRestore
+    }
+
+    is(sRestore) {
+      // restore original cell value (or after correction)
+      // mem(savedAddr) := mem(savedAddr) // simulate restore latency
+      state := sIdle
+    }
+
+    // WRITE PHASE
+    is(sWriteCycle) {
+      mem(savedAddr) := savedData
+      state := sIdle
+    }
+  }
+}
+
+
+
+class GatedDiodeMem(val n: Int, val w: Int,
+                    val readLatency: Int = 3,
+                    val writeLatency: Int = 4,
+                    val destructiveRead: Boolean = true)
+  extends Module {
+
+  val io = IO(new Bundle {
+    // READ
+    val raddr  = Input(UInt(log2Ceil(n).W))
+    val ren    = Input(Bool())
+    val rvalid = Output(Bool())
+    val rdata  = Output(UInt(w.W))
+
+    // WRITE
+    val waddr  = Input(UInt(log2Ceil(n).W))
+    val wen    = Input(Bool())
+    val wdata  = Input(UInt(w.W))
+    val wready = Output(Bool())
+
+    // BUSY (stall Gemmini)
+    val busy = Output(Bool())
+  })
+
+  // ------------------------------------------------------------------------
+  // 1. Underlying memory array
+  // ------------------------------------------------------------------------
+  val mem = Reg(Vec(n, UInt(w.W)))
+
+  // Store data early for functional correctness
+  // System-level visibility will be delayed by writeLatency cycles.
+  when(io.wen && io.wready) {
+    mem(io.waddr) := io.wdata
+  }
+
+  // ------------------------------------------------------------------------
+  // 2. Device timing model
+  // ------------------------------------------------------------------------
+  val readPipe  = RegInit(VecInit(Seq.fill(readLatency)(false.B)))
+  val writePipe = RegInit(VecInit(Seq.fill(writeLatency)(false.B)))
+
+  val readAddrPipe  = Reg(Vec(readLatency, UInt(log2Ceil(n).W)))
+  val readDataPipe  = Reg(Vec(readLatency, UInt(w.W)))
+
+  val writeActive   = writePipe.reduce(_||_)
+  val readActive    = readPipe.reduce(_||_)
+
+  io.busy := (writeActive || readActive)
+  io.wready := !writeActive   // can't accept a new write while writing
+
+  // ------------------------------------------------------------------------
+  // 3. READ OPERATION
+  // ------------------------------------------------------------------------
+  io.rvalid := readPipe.last
+  io.rdata  := readDataPipe.last
+
+  when(io.ren && !writeActive && !readActive) {
+    // Start read timing
+    readPipe(0) := true.B
+
+    // Captured read data for pipelining
+    readAddrPipe(0) := io.raddr
+    readDataPipe(0) := mem(io.raddr)
+
+    // Optional destructive read: write back original value later
+    when (destructiveRead) {
+      mem(io.raddr) := mem(io.raddr)  // to be expanded with restore timing
+    }
+  }
+
+  // Shift read pipeline
+  for (i <- 1 until readLatency) {
+    readPipe(i) := readPipe(i-1)
+    readAddrPipe(i) := readAddrPipe(i-1)
+    readDataPipe(i) := readDataPipe(i-1)
+  }
+
+  when(!io.ren) {
+    readPipe(0) := false.B
+  }
+
+  // ------------------------------------------------------------------------
+  // 4. WRITE OPERATION
+  // ------------------------------------------------------------------------
+  // Initiate write cycle
+  when(io.wen && io.wready) {
+    writePipe(0) := true.B
+  }
+
+  // Shift write pipeline
+  for(i <- 1 until writeLatency) {
+    writePipe(i) := writePipe(i-1)
+  }
+
+  when(!io.wen) {
+    writePipe(0) := false.B
+  }
+}
+
+
+//My version
+class GatedDiodeMem(val n: Int, val w: Int)
+extends module{
+    val io = IO(new Bundle 
+    {   
+        val nonVol input(Bool()) //value for defining whether read/write will be nv or v
+
+        ///////////////////
+        //reading signals//
+        ///////////////////
+        val ren    input(Bool())  //read enable signal
+        val raddr  input(log2Ceil(n).W)  //data address to read from
+        val rdata  output(UInt(w.W)) //data that was read from memory
+        val rvalid output(Bool()) //tells signal whether read was valid or not
+        
+        ///////////////////
+        //writing signals//
+        ///////////////////
+        val wen    input(Bool()) //write enable signal
+        val waddr  input(log2Ceil(n).W) //data address to write to
+        val wdata  input(UInt(w.W)) //data to write to address
+        val wready output(Bool()) //signals whether or not a write is currently happening
+        
+        //note1:
+        //the log2Ceil.W is a little bit confusing here, since n is our data size we need log2(n) bits to index it
+        //the .W afterwards is not associated with our input w, it's just a chisel literal for affirming bit width
+
+        val busy output(Bool())
+
+        //note2:
+        //gemminis scratch pad is dual ported, meaning that it
+        //can actually read and write at the same time, meaning that
+        //you need to differentiate between when the signal is busy reading
+        //and when signal is busy writing
+        //we still have a single busy signal though as well to communicate
+        //when it is reading so we can keep it as a status bit
+    })
+
+    //our actual memory in the behavorial model will be represented
+    //as basically just an array of registers
+    //the actual hardware of this would be a large assortment of flip flops
+    val mem = (Vec(n, UInt(w.W))) //n is number of entries, so size of memory
+                     //w is the bit width of each memory entry
+
+    val readLatency  = Uint()
+    val writeLatency = Uint()
+
+    when(nonVol)
+    {
+        readLatency = 4//latency of our non-volatile reads
+        writeLatency = 8//latency of our non-volatile writes
+    }
+    .otherwise
+    {
+        readLatency = 1 //latency of our non-volatile reads
+        writeLatency = 1//latency of our non-volatile writes
+    }
+
+    //instantiate
+    val readpipe     = RegInit(VecInit(Seq.fill(readLatency)(false.B))) //this is a pipe where we'll store our rvalid, when it reaches the end the data read will be marked valid
+    val writePipe    = RegInit(VecInit(Seq.fill(writeLatency)(false.B)))//this is just a stall pipe so the system has time to write
+ 
+    val readAddrPipe = Reg(Vec(readLatency,Uint(log2Ceil(n).W))) //We will store the read addr in this pipe and when the system has stalled the appropriate time we'll use the read addr in it
+    val readDataPipe = Reg(Vec(readLatency,Uint(w.W)))//Similar story to addrpipe but with the data instead
+
+    //when we begin to read or write we will store a 1 in the read or write pipes
+    //the 1 will be there to mark when the pipe has reached its end
+    //the 1 also serves as a sign that the system is active
+    //if we see a 1 anywhere in the pipe that means its busy
+    //these functions are just oring all values of the pipeline together
+    val readActive   = readpipe.reduce(_||_)
+    val writeActive  = writepipe.reduce(_||_)
+
+    wready := !writeActive
+    busy := (writeActive || readActive)
+
+
+    //////////////////
+    ////READ LOGIC////
+    //////////////////
+    //if we call a read and the system isn't already busy
+    if(iren && !busy)
+    {
+        readpipe(0)     := true.B
+        readAddrPipe(0) := io.raddr 
+        //we want to move raddr through the pipeline as insurance basically, in case we need the check the address the rdata came from and they get dysnced somehow
+        readDataPipe(0) := mem(io.raddr)  
+    }
+
+    //Set output values to equal value at the end of pipeline
+    //when we're done counting our desired data will be in this spot if successful
+    io.rdata  := readDataPipe(last)
+    io.rvalid := readpipe(last)
+
+    //Starting at 1, iterate i in loop until it reaches value of readLatency
+    //we want to shift the values of the pipe over 1 every iteration essentially
+    //we shift the values in the pipe until the value stored initially at 0 gets to the last stage 
+    for(i <- 1 until readLatency)
+    {
+        readpipe(i)     := readpipe(i-1)
+        readAddrPipe(i) := readAddrPipe(i-1)
+        readDataPipe(i) := readDataPipe(i-1)
+    }
+
+    when(!(io.ren && !busy))
+    {
+        readpipe(0) := 0
+        readAddrPipe(0) := 0
+        readDataPipe(0) := 0 
+    }
+
+
+    //////////////////
+    ////WRITE LOGIC////
+    //////////////////
+    //if we call a read and the system isn't already busy
+    if(wren && wready)
+    {   
+        //Write 1 in the pipe to indicate that it's busy
+        //write value to memory address
+        writePipe(0)  := true.B
+        mem(io.waddr) := io.wdata
+    }
+
+    //stall by making pipe run through this loop
+    //this keeps the system under the impression that it is busy writing
+    //basically just a stall to simulate behavior
+    for(i <- 1 until writeLatency)
+    {
+        writepipe(i) := writepipe(i-1)
+    }
+
+    when(!(io.wen && wready))
+    {
+        writepipe(0) := 0
+    }
+}

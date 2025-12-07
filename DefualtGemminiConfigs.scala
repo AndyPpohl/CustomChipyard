@@ -31,48 +31,47 @@ object GemminiConfigs {
     // Spatial array size options
     tileRows = 1,
     tileColumns = 1,
-    meshRows = 4,
-    meshColumns = 4,
+    meshRows = 16,
+    meshColumns = 16,
 
     // Spatial array PE options
     dataflow = Dataflow.BOTH,
 
     // Scratchpad and accumulator
-    sp_capacity = CapacityInKilobytes(64),
-    acc_capacity = CapacityInKilobytes(16),
+    sp_capacity = CapacityInKilobytes(256),
+    acc_capacity = CapacityInKilobytes(64),
 
     sp_banks = 4,
     acc_banks = 2,
 
     sp_singleported = true,
-    acc_singleported = false, //default was false
+    acc_singleported = false,
 
     // DNN options
-    has_training_convs = false,
-    has_max_pool = false,
-    has_nonlinear_activations = false, //all these were originally true
+    has_training_convs = true,
+    has_max_pool = true,
+    has_nonlinear_activations = true,
 
     // Reservation station entries
-    reservation_station_entries_ld = 1, //smallest were 112
-    reservation_station_entries_st = 1, //default is 8 4 16
-    reservation_station_entries_ex = 2,
+    reservation_station_entries_ld = 8,
+    reservation_station_entries_st = 4,
+    reservation_station_entries_ex = 16,
+
     // Ld/Ex/St instruction queue lengths
-    ld_queue_length = 4,
-    st_queue_length = 1,
-    ex_queue_length = 4,
+    ld_queue_length = 8,
+    st_queue_length = 2,
+    ex_queue_length = 8,
 
     // DMA options
-    max_in_flight_mem_reqs = 8,
+    max_in_flight_mem_reqs = 16,
 
-    dma_maxbytes = 48, //48 works
+    dma_maxbytes = 64,
     dma_buswidth = 128,
 
     // TLB options
     tlb_size = 4,
 
-    
     // Mvin and Accumulator scalar multiply options
-/*
     mvin_scale_args = Some(ScaleArguments(
       (t: SInt, f: Float) => {
         val f_rec = recFNFromFN(f.expWidth, f.sigWidth, f.bits)
@@ -111,41 +110,10 @@ object GemminiConfigs {
       identity = "1.0",
       c_str = "({float y = ROUND_NEAR_EVEN((x) * (scale)); y > INT8_MAX ? INT8_MAX : (y < INT8_MIN ? INT8_MIN : (elem_t)y);})"
     )),
-    
-*/
-    //mvin_scale_args = None,
+
     mvin_scale_acc_args = None,
     mvin_scale_shared = false,
-    //acc_scale_args = None,
-    
-    // cheap integer identity scaler for mvin (no hardfloat)
-    
-    mvin_scale_args = Some(ScaleArguments(
-      (t: SInt, f: Float) => {
-        // Identity scaling — no hardware FP
-        t
-      },
-      4,                     // same as default (latency)
-      Float(8, 24),          // same as default (format)
-      4,                     // same as default (scale latency)
-      identity = "1.0",      // same as default
-      c_str = "({elem_t y = (elem_t)(x); y;})" // trivial C version
-    )),
 
-
-    acc_scale_args = Some(ScaleArguments(
-      (t: SInt, f: Float) => {
-        // Identity scaling — no hardware FP
-        t
-      },
-      8,                     // same as default
-      Float(8, 24),          // same as default
-      -1,                    // same as default
-      identity = "1.0",
-      c_str = "({acc_t y = (acc_t)(x); y;})"
-    )),
-
-/* 
     acc_scale_args = Some(ScaleArguments(
       (t: SInt, f: Float) => {
         val f_rec = recFNFromFN(f.expWidth, f.sigWidth, f.bits)
@@ -184,13 +152,12 @@ object GemminiConfigs {
       identity = "1.0",
       c_str = "({float y = ROUND_NEAR_EVEN((x) * (scale)); y > INT8_MAX ? INT8_MAX : (y < INT8_MIN ? INT8_MIN : (acc_t)y);})"
     )),
-*/
 
     // SoC counters options
-    num_counter = 2, //likely need at least one counter
+    num_counter = 8,
 
     // Scratchpad and Accumulator input/output options
-    acc_read_full_width = false,
+    acc_read_full_width = true,
     acc_read_small_width = true,
 
     ex_read_from_spad = true,

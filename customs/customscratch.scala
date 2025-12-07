@@ -435,7 +435,7 @@ class GatedDiodeMem(val n: Int, val w: Int,
 
 
 //My version
-class GatedDiodeMem(val n: Int, val w: Int)
+class GatedDiodeMemModule(val n: Int, val w: Int)
 extends module{
     val io = IO(new Bundle 
     {   
@@ -569,5 +569,36 @@ extends module{
     when(!(io.wen && wready))
     {
         writepipe(0) := 0
+    }
+}
+
+
+
+//My version with adjusted class behavior
+class GatedDiodeMem(n: Int, w: Int, readLatency: Int, writeLatency: writeLatency)
+{
+
+    val meminst = Module(new GatedDiodeMemModule(n, w, readLatency, writeLatency))
+
+    //////////////////
+    ////READ LOGIC////
+    //////////////////
+    def read(addr: UInt, en: Bool): Uint =
+    {
+      meminst.io.ren := en
+      meminst.io.raddr := addr 
+      
+      return meminst.io.readData
+    }
+
+    //////////////////
+    ////WRITE LOGIC////
+    //////////////////
+    //if we call a read and the system isn't already busy
+    def write(addr: UInt, data: UInt): Unit = 
+    {
+      inst.io.waddr := addr
+      inst.io.wdata := data
+      inst.io.wen := true.B
     }
 }

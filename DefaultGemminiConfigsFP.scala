@@ -20,13 +20,13 @@ object GemminiFPConfigs {
     meshRows = 4,
     meshColumns = 4,
 
-    ld_queue_length = 4, //default is 8 2 8
-    st_queue_length = 1,
-    ex_queue_length = 4,
+    ld_queue_length = 8,
+    st_queue_length = 2,
+    ex_queue_length = 8,
 
-    reservation_station_entries_ld = 1, //smallest is 112
-    reservation_station_entries_st = 1, //default is 8 4 16
-    reservation_station_entries_ex = 2,
+    reservation_station_entries_ld = 8,
+    reservation_station_entries_st = 4,
+    reservation_station_entries_ex = 16,
 
     sp_banks = 4,
     sp_singleported = true,
@@ -81,7 +81,7 @@ object GemminiFPConfigs {
     has_max_pool = true,
     has_nonlinear_activations = true,
 
-    num_counter = 2,
+    num_counter = 8,
   )
   
   //FP32 Single Precision Configuration
@@ -208,3 +208,4 @@ class GemminiBF16Default8Config extends Config((site, here, up) => {
     }
   )
 })
+

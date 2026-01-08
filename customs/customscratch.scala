@@ -1,4 +1,16 @@
 
+package gemmini
+
+import chisel3.{Bool, _}
+import chisel3.util._
+import chisel3.util.ShiftRegister
+import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.diplomacy.{LazyModule, LazyModuleImp}
+import freechips.rocketchip.rocket._
+import freechips.rocketchip.tile._
+import freechips.rocketchip.tilelink._
+import Util._
+
 class ScratchpadMemReadRequest[U <: Data](local_addr_t: LocalAddr, scale_t_bits: Int)(implicit p: Parameters) extends CoreBundle {
   val vaddr = UInt(coreMaxAddrBits.W)
   val laddr = local_addr_t.cloneType
@@ -42,6 +54,25 @@ class ScratchpadMemWriteRequest(local_addr_t: LocalAddr, acc_t_bits: Int, scale_
 
 }
 
+class ScratchpadMemWriteResponse extends Bundle {
+  val cmd_id = UInt(8.W) // TODO don't use a magic number here
+}
+
+class ScratchpadMemReadResponse extends Bundle {
+  val bytesRead = UInt(16.W) // TODO magic number here
+  val cmd_id = UInt(8.W) // TODO don't use a magic number here
+}
+
+class ScratchpadReadMemIO[U <: Data](local_addr_t: LocalAddr, scale_t_bits: Int)(implicit p: Parameters) extends CoreBundle {
+  val req = Decoupled(new ScratchpadMemReadRequest(local_addr_t, scale_t_bits))
+  val resp = Flipped(Valid(new ScratchpadMemReadResponse))
+}
+
+class ScratchpadWriteMemIO(local_addr_t: LocalAddr, acc_t_bits: Int, scale_t_bits: Int)
+                         (implicit p: Parameters) extends CoreBundle {
+  val req = Decoupled(new ScratchpadMemWriteRequest(local_addr_t, acc_t_bits, scale_t_bits))
+  val resp = Flipped(Valid(new ScratchpadMemWriteResponse))
+}
 
 class ScratchpadReadReq(val n: Int) extends Bundle {
   val addr = UInt(log2Ceil(n).W)
@@ -58,6 +89,14 @@ class ScratchpadReadIO(val n: Int, val w: Int) extends Bundle {
   val resp = Flipped(Decoupled(new ScratchpadReadResp(w)))
 }
 
+class ScratchpadWriteIO(val n: Int, val w: Int, val mask_len: Int) extends Bundle {
+  val valid = Output(Bool())
+  val ready = Input(Bool())
+  val addr = Output(UInt(log2Ceil(n).W))
+  val mask = Output(Vec(mask_len, Bool()))
+  val data = Output(UInt(w.W))
+  def fire = valid && ready
+}
 
 class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, use_shared_ext_mem: Boolean, is_dummy: Boolean) extends Module {
   // This is essentially a pipelined SRAM with the ability to stall pipeline stages
@@ -122,30 +161,64 @@ class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, us
     }
     // assert(wq.io.enq.ready || (!io.write.en), "TODO (richard): fix this if triggered")
   } else { // use valid only interface
-    val mem = SyncReadMem(n, Vec(mask_len, mask_elem))
-    //this SyncReadMem is what I actually want to replace
-    //
+    //val mem = SyncReadMem(n, Vec(mask_len, mask_elem))
+    
+    //val mem = GatedDiodeMem(n, mask_elem.getWidth, mask_len, 3, 3)(this)
 
+    val mem = Module(new GatedDiodeMemModule(
+      n = n,
+      w = mask_elem.getWidth,
+      mask_len = mask_len,
+      mask_elem = mask_elem,
+      readLatency = 4,
+      writeLatency = 4
+    ))
 
-    val raddr = io.read.req.bits.addr
-    val rdata = if (single_ported) {
-      assert(!(ren && io.write.fire))
-      mem.read(raddr, ren && !io.write.fire).asUInt
-    } else {
-      mem.read(raddr, ren).asUInt
-    }
-    q.io.enq.valid := RegNext(ren)
-    q.io.enq.bits.data := rdata
-    q.io.enq.bits.fromDMA := RegNext(fromDMA)
+    
+    mem.io.rreq.valid := false.B
+    mem.io.rreq.bits.addr := 0.U
+    mem.io.wreq.valid := false.B
+    mem.io.wreq.bits.addr := 0.U
+    mem.io.wreq.bits.data := 0.U.asTypeOf(Vec(mask_len, mask_elem))
+    mem.io.wreq.bits.mask := VecInit(Seq.fill(mask_len)(false.B))
 
-    io.read.req.ready := q_will_be_empty && !singleport_busy_with_write
+    val dren = io.read.req.valid
 
-    io.write.ready := true.B
+    val effectiveRen = 
+      if (single_ported) {
+        assert(!(dren && io.write.fire))
+        dren && !io.write.fire
+      }
+      else {
+        dren
+      }
+    
+    val canIssueRead = q_will_be_empty && !singleport_busy_with_write && q.io.enq.ready
+    
+    mem.io.rreq.valid := effectiveRen && canIssueRead
+    mem.io.rreq.bits.addr := io.read.req.bits.addr
+ 
+    io.read.req.ready := mem.io.rreq.ready && canIssueRead
+    
+    q.io.enq.valid     := mem.io.rresp.valid
+    q.io.enq.bits.data := mem.io.rresp.bits.data.asUInt
+    mem.io.rresp.ready := q.io.enq.ready
+
+    val fromDMA_reg = RegEnable(io.read.req.bits.fromDMA, mem.io.rreq.fire)
+    q.io.enq.bits.fromDMA := RegNext(fromDMA_reg)
+
+    io.write.ready := mem.io.wreq.ready
+
     when(io.write.fire) {
-      if (aligned_to >= w)
-        mem.write(io.write.addr, io.write.data.asTypeOf(Vec(mask_len, mask_elem)), VecInit((~(0.U(mask_len.W))).asBools))
-      else
-        mem.write(io.write.addr, io.write.data.asTypeOf(Vec(mask_len, mask_elem)), io.write.mask)
+      mem.io.wreq.valid := true.B
+      mem.io.wreq.bits.addr := io.write.addr
+      mem.io.wreq.bits.data := io.write.data.asTypeOf(Vec(mask_len, mask_elem))
+
+      if (aligned_to >= w) {
+        mem.io.wreq.bits.mask := VecInit(Seq.fill(mask_len)(true.B))
+      } else {
+        mem.io.wreq.bits.mask := io.write.mask
+      }
     }
   }
 
@@ -153,452 +226,1223 @@ class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, us
 }
 
 
-class GatedDiodeMem(val n: Int, val w: Int,
-                    val readLatency: Int = 3,
-                    val writeLatency: Int = 2,
-                    val destructiveRead: Boolean = true)
-  extends Module {
+class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, U, V])
+    (implicit p: Parameters, ev: Arithmetic[T]) extends LazyModule {
 
-  val io = IO(new Bundle {
-    val raddr = Input(UInt(log2Ceil(n).W))
-    val ren   = Input(Bool())
-    val rvalid = Output(Bool())
-    val rdata  = Output(UInt(w.W))
+  import config._
+  import ev._
 
-    val waddr = Input(UInt(log2Ceil(n).W))
-    val wen   = Input(Bool())
-    val wdata = Input(UInt(w.W))
-    val wready = Output(Bool())
+  val maxBytes = dma_maxbytes
+  val dataBits = dma_buswidth
 
-    val busy = Output(Bool())
-  })
+  val block_rows = meshRows * tileRows
+  val block_cols = meshColumns * tileColumns
+  val spad_w = inputType.getWidth *  block_cols
+  val acc_w = accType.getWidth * block_cols
 
-  // Underlying storage (still a vector of registers for simulation)
-  val mem = Reg(Vec(n, UInt(w.W)))
+  val id_node = TLIdentityNode()
+  val xbar_node = TLXbar()
 
-  // Internal busy flag for multi-cycle ops
-  val (idle :: reading :: writing :: Nil) = Enum(3)
-  val state = RegInit(idle)
+  val reader = LazyModule(new StreamReader(config, max_in_flight_mem_reqs, dataBits, maxBytes, spad_w, acc_w, aligned_to,
+    sp_banks * sp_bank_entries, acc_banks * acc_bank_entries, block_rows, use_tlb_register_filter,
+    use_firesim_simulation_counters))
+  val writer = LazyModule(new StreamWriter(max_in_flight_mem_reqs, dataBits, maxBytes,
+    if (acc_read_full_width) acc_w else spad_w, aligned_to, inputType, block_cols, use_tlb_register_filter,
+    use_firesim_simulation_counters))
+  val spad_writer = Option.when(config.use_tl_ext_mem)(LazyModule(new StreamWriter(max_in_flight_mem_reqs, dataBits, maxBytes,
+    if (acc_read_full_width) acc_w else spad_w, aligned_to, inputType, block_cols, use_tlb_register_filter,
+    use_firesim_simulation_counters)))
 
-  val readCounter  = Reg(UInt(8.W))
-  val writeCounter = Reg(UInt(8.W))
+  // TODO make a cross-bar vs two separate ports a config option
+  // id_node :=* reader.node
+  // id_node :=* writer.node
 
-  val readAddrReg  = Reg(UInt(log2Ceil(n).W))
-  val readDataReg  = Reg(UInt(w.W))
+  xbar_node := TLBuffer() := reader.node // TODO
+  xbar_node := TLBuffer() := writer.node
+  id_node := TLWidthWidget(config.dma_buswidth/8) := TLBuffer() := xbar_node
 
-  io.rdata := readDataReg
-  io.rvalid := false.B
-  io.busy := state =/= idle
-  io.wready := (state === idle)
-
-  switch(state) {
-
-    // -------------------------
-    // IDLE: Accept new operations
-    // -------------------------
-    is(idle) {
-      when(io.ren) {
-        readAddrReg := io.raddr
-        readCounter := (readLatency - 1).U
-        state := reading
+  lazy val module = new Impl
+  class Impl extends LazyModuleImp(this) with HasCoreParameters {
+    val io = IO(new Bundle {
+      // DMA ports
+      val dma = new Bundle {
+        val read = Flipped(new ScratchpadReadMemIO(local_addr_t, mvin_scale_t_bits))
+        val write = Flipped(new ScratchpadWriteMemIO(local_addr_t, accType.getWidth, acc_scale_t_bits))
       }
-      when(io.wen) {
-        mem(io.waddr) := io.wdata  // initiate write
-        writeCounter := (writeLatency - 1).U
-        state := writing
+
+      // SRAM ports
+      val srams = new Bundle {
+        val read = Flipped(Vec(sp_banks, new ScratchpadReadIO(sp_bank_entries, spad_w)))
+        val write = Flipped(Vec(sp_banks, new ScratchpadWriteIO(sp_bank_entries, spad_w, (spad_w / (aligned_to * 8)) max 1)))
       }
+
+      // Accumulator ports
+      val acc = new Bundle {
+        val read_req = Flipped(Vec(acc_banks, Decoupled(new AccumulatorReadReq(
+          acc_bank_entries, accType, acc_scale_t.asInstanceOf[V]
+        ))))
+        val read_resp = Vec(acc_banks, Decoupled(new AccumulatorScaleResp(
+          Vec(meshColumns, Vec(tileColumns, inputType)),
+          Vec(meshColumns, Vec(tileColumns, accType))
+        )))
+        val write = Flipped(Vec(acc_banks, Decoupled(new AccumulatorWriteReq(
+          acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))
+        ))))
+      }
+
+      val ext_mem = if (use_shared_ext_mem) {
+        Some(new ExtSpadMemIO(sp_banks, acc_banks, acc_sub_banks))
+      } else {
+        None
+      }
+
+      // TLB ports
+      val tlb = Vec(2 + spad_writer.map(_ => 1).getOrElse(0), new FrontendTLBIO)
+
+      // Misc. ports
+      val busy = Output(Bool())
+      val flush = Input(Bool())
+      val counter = new CounterEventIO()
+    })
+
+    val write_dispatch_q = Queue(io.dma.write.req)
+    // Write norm/scale queues are necessary to maintain in-order requests to accumulator norm/scale units
+    // Writes from main SPAD just flow directly between scale_q and issue_q, while writes
+    // From acc are ordered
+    val write_norm_q = Module(new Queue(new ScratchpadMemWriteRequest(local_addr_t, accType.getWidth, acc_scale_t_bits), spad_read_delay+2))
+    val write_scale_q = Module(new Queue(new ScratchpadMemWriteRequest(local_addr_t, accType.getWidth, acc_scale_t_bits), spad_read_delay+2))
+    val write_issue_q = Module(new Queue(new ScratchpadMemWriteRequest(local_addr_t, accType.getWidth, acc_scale_t_bits), spad_read_delay+1, pipe=true))
+    val read_issue_q = Module(new Queue(new ScratchpadMemReadRequest(local_addr_t, mvin_scale_t_bits), spad_read_delay+1, pipe=true)) // TODO can't this just be a normal queue?
+
+    write_dispatch_q.ready := false.B
+
+    write_norm_q.io.enq.valid := false.B
+    write_norm_q.io.enq.bits := write_dispatch_q.bits
+    write_norm_q.io.deq.ready := false.B
+
+    write_scale_q.io.enq.valid := false.B
+    write_scale_q.io.enq.bits  := write_norm_q.io.deq.bits
+    write_scale_q.io.deq.ready := false.B
+
+    write_issue_q.io.enq.valid := false.B
+    write_issue_q.io.enq.bits := write_scale_q.io.deq.bits
+
+    // Garbage can immediately fire from dispatch_q -> norm_q
+    when (write_dispatch_q.bits.laddr.is_garbage()) {
+      write_norm_q.io.enq <> write_dispatch_q
     }
 
-    // -------------------------
-    // READING: multi-cycle read
-    // -------------------------
-    is(reading) {
+    // Non-acc or garbage can immediately fire between norm_q and scale_q
+    when (write_norm_q.io.deq.bits.laddr.is_garbage() || !write_norm_q.io.deq.bits.laddr.is_acc_addr) {
+      write_scale_q.io.enq <> write_norm_q.io.deq
+    }
 
-      when(readCounter === 0.U) {
-        // read completes
-        val data = mem(readAddrReg)
-        readDataReg := data
-        io.rvalid := true.B
+    // Non-acc or garbage can immediately fire between scale_q and issue_q
+    when (write_scale_q.io.deq.bits.laddr.is_garbage() || !write_scale_q.io.deq.bits.laddr.is_acc_addr) {
+      write_issue_q.io.enq <> write_scale_q.io.deq
+    }
 
-        when(destructiveRead) {
-          // destructive read -> restore value
-          mem(readAddrReg) := data
+    val writeData = Wire(Valid(UInt((spad_w max acc_w).W)))
+    writeData.valid := write_issue_q.io.deq.bits.laddr.is_garbage()
+    writeData.bits := DontCare
+    val fullAccWriteData = Wire(UInt(acc_w.W))
+    fullAccWriteData := DontCare
+    val writeData_is_full_width = !write_issue_q.io.deq.bits.laddr.is_garbage() &&
+      write_issue_q.io.deq.bits.laddr.is_acc_addr && write_issue_q.io.deq.bits.laddr.read_full_acc_row
+    val writeData_is_all_zeros = write_issue_q.io.deq.bits.laddr.is_garbage()
+
+    writer.module.io.req.valid := write_issue_q.io.deq.valid && writeData.valid && !write_issue_q.io.deq.bits.dest.asBool
+    // write_issue_q.io.deq.ready := writer.module.io.req.ready && writeData.valid
+    writer.module.io.req.bits.vaddr := write_issue_q.io.deq.bits.vaddr
+    writer.module.io.req.bits.physical := write_issue_q.io.deq.bits.dest
+    writer.module.io.req.bits.len := Mux(writeData_is_full_width,
+      write_issue_q.io.deq.bits.len * (accType.getWidth / 8).U,
+      write_issue_q.io.deq.bits.len * (inputType.getWidth / 8).U)
+    writer.module.io.req.bits.data := MuxCase(writeData.bits, Seq(
+       writeData_is_all_zeros -> 0.U,
+       writeData_is_full_width -> fullAccWriteData
+    ))
+    writer.module.io.req.bits.block := write_issue_q.io.deq.bits.block
+    writer.module.io.req.bits.status := write_issue_q.io.deq.bits.status
+    writer.module.io.req.bits.pool_en := write_issue_q.io.deq.bits.pool_en
+    writer.module.io.req.bits.store_en := write_issue_q.io.deq.bits.store_en
+
+    write_issue_q.io.deq.ready := writer.module.io.req.ready &&
+      spad_writer.map(_.module.io.req.ready).getOrElse(true.B) && writeData.valid
+    spad_writer.foreach { spad_writer =>
+      spad_writer.module.io.req.valid := write_issue_q.io.deq.valid && writeData.valid && write_issue_q.io.deq.bits.dest.asBool
+      spad_writer.module.io.req.bits.vaddr := config.tl_ext_mem_base.U |
+        (write_issue_q.io.deq.bits.vaddr.asUInt << log2Ceil(config.DIM * config.inputType.getWidth / 8).U).asUInt
+      spad_writer.module.io.req.bits.physical := write_issue_q.io.deq.bits.dest
+      spad_writer.module.io.req.bits.len := Mux(writeData_is_full_width,
+        write_issue_q.io.deq.bits.len * (accType.getWidth / 8).U,
+        write_issue_q.io.deq.bits.len * (inputType.getWidth / 8).U)
+      spad_writer.module.io.req.bits.data := MuxCase(writeData.bits, Seq(
+        writeData_is_all_zeros -> 0.U,
+        writeData_is_full_width -> fullAccWriteData
+      ))
+      spad_writer.module.io.req.bits.block := write_issue_q.io.deq.bits.block
+      spad_writer.module.io.req.bits.status := write_issue_q.io.deq.bits.status
+      spad_writer.module.io.req.bits.pool_en := write_issue_q.io.deq.bits.pool_en
+      spad_writer.module.io.req.bits.store_en := write_issue_q.io.deq.bits.store_en
+    }
+
+    io.dma.write.resp.valid := false.B
+    io.dma.write.resp.bits.cmd_id := write_dispatch_q.bits.cmd_id
+    when (write_dispatch_q.bits.laddr.is_garbage() && write_dispatch_q.fire) {
+      io.dma.write.resp.valid := true.B
+    }
+
+    read_issue_q.io.enq <> io.dma.read.req
+
+    val zero_writer = Module(new ZeroWriter(config, new ScratchpadMemReadRequest(local_addr_t, mvin_scale_t_bits)))
+
+    when (io.dma.read.req.bits.all_zeros) {
+      read_issue_q.io.enq.valid := false.B
+      io.dma.read.req.ready := zero_writer.io.req.ready
+    }
+
+    zero_writer.io.req.valid := io.dma.read.req.valid && io.dma.read.req.bits.all_zeros
+    zero_writer.io.req.bits.laddr := io.dma.read.req.bits.laddr
+    zero_writer.io.req.bits.cols := io.dma.read.req.bits.cols
+    zero_writer.io.req.bits.block_stride := io.dma.read.req.bits.block_stride
+    zero_writer.io.req.bits.tag := io.dma.read.req.bits
+
+    val zero_writer_pixel_repeater = Module(new PixelRepeater(inputType, local_addr_t, block_cols, aligned_to, new ScratchpadMemReadRequest(local_addr_t, mvin_scale_t_bits), passthrough = !has_first_layer_optimizations))
+    zero_writer_pixel_repeater.io.req.valid := zero_writer.io.resp.valid
+    zero_writer_pixel_repeater.io.req.bits.in := 0.U.asTypeOf(Vec(block_cols, inputType))
+    zero_writer_pixel_repeater.io.req.bits.laddr := zero_writer.io.resp.bits.laddr
+    zero_writer_pixel_repeater.io.req.bits.len := zero_writer.io.resp.bits.tag.cols
+    zero_writer_pixel_repeater.io.req.bits.pixel_repeats := zero_writer.io.resp.bits.tag.pixel_repeats
+    zero_writer_pixel_repeater.io.req.bits.last := zero_writer.io.resp.bits.last
+    zero_writer_pixel_repeater.io.req.bits.tag := zero_writer.io.resp.bits.tag
+    zero_writer_pixel_repeater.io.req.bits.mask := {
+      val n = inputType.getWidth / 8
+      val mask = zero_writer.io.resp.bits.mask
+      val expanded = VecInit(mask.flatMap(e => Seq.fill(n)(e)))
+      expanded
+    }
+
+    zero_writer.io.resp.ready := zero_writer_pixel_repeater.io.req.ready
+    zero_writer_pixel_repeater.io.resp.ready := false.B
+
+    reader.module.io.req.valid := read_issue_q.io.deq.valid
+    read_issue_q.io.deq.ready := reader.module.io.req.ready
+    reader.module.io.req.bits.vaddr := read_issue_q.io.deq.bits.vaddr
+    reader.module.io.req.bits.spaddr := Mux(read_issue_q.io.deq.bits.laddr.is_acc_addr,
+      read_issue_q.io.deq.bits.laddr.full_acc_addr(), read_issue_q.io.deq.bits.laddr.full_sp_addr())
+    reader.module.io.req.bits.len := read_issue_q.io.deq.bits.cols
+    reader.module.io.req.bits.repeats := read_issue_q.io.deq.bits.repeats
+    reader.module.io.req.bits.pixel_repeats := read_issue_q.io.deq.bits.pixel_repeats
+    reader.module.io.req.bits.scale := read_issue_q.io.deq.bits.scale
+    reader.module.io.req.bits.is_acc := read_issue_q.io.deq.bits.laddr.is_acc_addr
+    reader.module.io.req.bits.accumulate := read_issue_q.io.deq.bits.laddr.accumulate
+    reader.module.io.req.bits.has_acc_bitwidth := read_issue_q.io.deq.bits.has_acc_bitwidth
+    reader.module.io.req.bits.block_stride := read_issue_q.io.deq.bits.block_stride
+    reader.module.io.req.bits.status := read_issue_q.io.deq.bits.status
+    reader.module.io.req.bits.cmd_id := read_issue_q.io.deq.bits.cmd_id
+
+    val (mvin_scale_in, mvin_scale_out) = VectorScalarMultiplier(
+      config.mvin_scale_args,
+      config.inputType, config.meshColumns * config.tileColumns, chiselTypeOf(reader.module.io.resp.bits),
+      is_acc = false
+    )
+    val (mvin_scale_acc_in, mvin_scale_acc_out) = if (mvin_scale_shared) (mvin_scale_in, mvin_scale_out) else (
+      VectorScalarMultiplier(
+        config.mvin_scale_acc_args,
+        config.accType, config.meshColumns * config.tileColumns, chiselTypeOf(reader.module.io.resp.bits),
+        is_acc = true
+      )
+    )
+
+    mvin_scale_in.valid := reader.module.io.resp.valid && (mvin_scale_shared.B || !reader.module.io.resp.bits.is_acc ||
+      (reader.module.io.resp.bits.is_acc && !reader.module.io.resp.bits.has_acc_bitwidth))
+
+    mvin_scale_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_in.bits.in))
+    mvin_scale_in.bits.scale := reader.module.io.resp.bits.scale.asTypeOf(mvin_scale_t)
+    mvin_scale_in.bits.repeats := reader.module.io.resp.bits.repeats
+    mvin_scale_in.bits.pixel_repeats := reader.module.io.resp.bits.pixel_repeats
+    mvin_scale_in.bits.last := reader.module.io.resp.bits.last
+    mvin_scale_in.bits.tag := reader.module.io.resp.bits
+
+    val mvin_scale_pixel_repeater = Module(new PixelRepeater(inputType, local_addr_t, block_cols, aligned_to, mvin_scale_out.bits.tag.cloneType, passthrough = !has_first_layer_optimizations))
+    mvin_scale_pixel_repeater.io.req.valid := mvin_scale_out.valid
+    mvin_scale_pixel_repeater.io.req.bits.in := mvin_scale_out.bits.out
+    mvin_scale_pixel_repeater.io.req.bits.mask := mvin_scale_out.bits.tag.mask take mvin_scale_pixel_repeater.io.req.bits.mask.size
+    mvin_scale_pixel_repeater.io.req.bits.laddr := mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
+    mvin_scale_pixel_repeater.io.req.bits.len := mvin_scale_out.bits.tag.len
+    mvin_scale_pixel_repeater.io.req.bits.pixel_repeats := mvin_scale_out.bits.tag.pixel_repeats
+    mvin_scale_pixel_repeater.io.req.bits.last := mvin_scale_out.bits.last
+    mvin_scale_pixel_repeater.io.req.bits.tag := mvin_scale_out.bits.tag
+
+    mvin_scale_out.ready := mvin_scale_pixel_repeater.io.req.ready
+    mvin_scale_pixel_repeater.io.resp.ready := false.B
+
+    if (!mvin_scale_shared) {
+      mvin_scale_acc_in.valid := reader.module.io.resp.valid &&
+        (reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth)
+      mvin_scale_acc_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_acc_in.bits.in))
+      mvin_scale_acc_in.bits.scale := reader.module.io.resp.bits.scale.asTypeOf(mvin_scale_acc_t)
+      mvin_scale_acc_in.bits.repeats := reader.module.io.resp.bits.repeats
+      mvin_scale_acc_in.bits.pixel_repeats := 1.U
+      mvin_scale_acc_in.bits.last := reader.module.io.resp.bits.last
+      mvin_scale_acc_in.bits.tag := reader.module.io.resp.bits
+
+      mvin_scale_acc_out.ready := false.B
+    }
+
+    reader.module.io.resp.ready := Mux(reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth,
+      mvin_scale_acc_in.ready, mvin_scale_in.ready)
+
+    val mvin_scale_finished = mvin_scale_pixel_repeater.io.resp.fire && mvin_scale_pixel_repeater.io.resp.bits.last
+    val mvin_scale_acc_finished = mvin_scale_acc_out.fire && mvin_scale_acc_out.bits.last
+    val zero_writer_finished = zero_writer_pixel_repeater.io.resp.fire && zero_writer_pixel_repeater.io.resp.bits.last
+
+    val zero_writer_bytes_read = Mux(zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr,
+      zero_writer_pixel_repeater.io.resp.bits.tag.cols * (accType.getWidth / 8).U,
+      zero_writer_pixel_repeater.io.resp.bits.tag.cols * (inputType.getWidth / 8).U)
+
+    // For DMA read responses, mvin_scale gets first priority, then mvin_scale_acc, and then zero_writer
+    io.dma.read.resp.valid := mvin_scale_finished || mvin_scale_acc_finished || zero_writer_finished
+
+    // io.dma.read.resp.bits.cmd_id := MuxCase(zero_writer.io.resp.bits.tag.cmd_id, Seq(
+    io.dma.read.resp.bits.cmd_id := MuxCase(zero_writer_pixel_repeater.io.resp.bits.tag.cmd_id, Seq(
+      // mvin_scale_finished -> mvin_scale_out.bits.tag.cmd_id,
+      mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.cmd_id,
+      mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.cmd_id))
+
+    io.dma.read.resp.bits.bytesRead := MuxCase(zero_writer_bytes_read, Seq(
+      // mvin_scale_finished -> mvin_scale_out.bits.tag.bytes_read,
+      mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.bytes_read,
+      mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.bytes_read))
+
+    io.tlb(0) <> writer.module.io.tlb
+    io.tlb(1) <> reader.module.io.tlb
+    spad_writer match {
+      case Some(sw) => {
+        io.tlb(2) <> sw.module.io.tlb
+        sw.module.io.flush := io.flush
+      }
+      case None => {}
+    }
+
+    writer.module.io.flush := io.flush
+    reader.module.io.flush := io.flush
+
+    io.busy := writer.module.io.busy || spad_writer.map(_.module.io.busy).getOrElse(false.B) || reader.module.io.busy ||
+      write_issue_q.io.deq.valid || write_norm_q.io.deq.valid || write_scale_q.io.deq.valid || write_dispatch_q.valid
+
+    val spad_mems = {
+      val banks = Seq.fill(sp_banks) { Module(new ScratchpadBank(
+        sp_bank_entries, spad_w,
+        aligned_to, config.sp_singleported,
+        use_shared_ext_mem, is_dummy
+      )) }
+      val bank_ios = VecInit(banks.map(_.io))
+      // Reading from the SRAM banks
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
+        if (use_shared_ext_mem) {
+          io.ext_mem.get.spad(i) <> bio.ext_mem.get
         }
 
-        state := idle
+        val ex_read_req = io.srams.read(i).req
+        val exread = ex_read_req.valid
+
+        // TODO we tie the write dispatch queue's, and write issue queue's, ready and valid signals together here
+        val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
+          !write_dispatch_q.bits.laddr.is_garbage() &&
+          !(bio.write.fire && config.sp_singleported.B) &&
+          !write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.sp_bank() === i.U
+
+        bio.read.req.valid := exread || dmawrite
+        ex_read_req.ready := bio.read.req.ready
+
+        // The ExecuteController gets priority when reading from SRAMs
+        when (exread) {
+          bio.read.req.bits.addr := ex_read_req.bits.addr
+          bio.read.req.bits.fromDMA := false.B
+        }.elsewhen (dmawrite) {
+          bio.read.req.bits.addr := write_dispatch_q.bits.laddr.sp_row()
+          bio.read.req.bits.fromDMA := true.B
+
+          when (bio.read.req.fire) {
+            write_dispatch_q.ready := true.B
+            write_norm_q.io.enq.valid := true.B
+
+            io.dma.write.resp.valid := true.B
+          }
+        }.otherwise {
+          bio.read.req.bits := DontCare
+        }
+
+        val dma_read_resp = Wire(Decoupled(new ScratchpadReadResp(spad_w)))
+        dma_read_resp.valid := bio.read.resp.valid && bio.read.resp.bits.fromDMA
+        dma_read_resp.bits := bio.read.resp.bits
+        val ex_read_resp = Wire(Decoupled(new ScratchpadReadResp(spad_w)))
+        ex_read_resp.valid := bio.read.resp.valid && !bio.read.resp.bits.fromDMA
+        ex_read_resp.bits := bio.read.resp.bits
+
+        val dma_read_pipe = Module(new Queue(dma_read_resp.bits.cloneType, spad_read_delay, flow = false, pipe = true))
+        val ex_read_pipe = Module(new Queue(ex_read_resp.bits.cloneType, spad_read_delay, flow = false, pipe = true))
+
+        dma_read_pipe.io.enq <> dma_read_resp
+        ex_read_pipe.io.enq <> ex_read_resp
+
+        bio.read.resp.ready := Mux(bio.read.resp.bits.fromDMA, dma_read_resp.ready, ex_read_resp.ready)
+
+        dma_read_pipe.io.deq.ready := writer.module.io.req.ready &&
+          spad_writer.map(_.module.io.req.ready).getOrElse(true.B) &&
+          (!write_issue_q.io.deq.bits.laddr.is_acc_addr && write_issue_q.io.deq.bits.laddr.sp_bank() === i.U && // I believe we don't need to check that write_issue_q is valid here, because if the SRAM's resp is valid, then that means that the write_issue_q's deq should also be valid
+          write_issue_q.io.deq.valid) && !write_issue_q.io.deq.bits.laddr.is_garbage()
+        when (dma_read_pipe.io.deq.fire) {
+          writeData.valid := true.B
+          writeData.bits := dma_read_pipe.io.deq.bits.data
+        }
+
+        io.srams.read(i).resp <> ex_read_pipe.io.deq
       }
-      .otherwise {
-        readCounter := readCounter - 1.U
+
+      // Writing to the SRAM banks
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
+        val exwrite = io.srams.write(i).valid
+        io.srams.write(i).ready := bio.write.ready
+
+        // val laddr = mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
+        val laddr = mvin_scale_pixel_repeater.io.resp.bits.laddr
+
+        // val dmaread = mvin_scale_out.valid && !mvin_scale_out.bits.tag.is_acc &&
+        val dmaread = mvin_scale_pixel_repeater.io.resp.valid && !mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc &&
+          (laddr.sp_bank() === i.U) && bio.write.ready
+
+        // We need to make sure that we don't try to return a dma read resp from both zero_writer and either mvin_scale
+        // or mvin_acc_scale at the same time. The scalers always get priority in those cases
+        /* val zerowrite = zero_writer.io.resp.valid && !zero_writer.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer.io.resp.bits.laddr.sp_bank() === i.U && */
+        val zerowrite = zero_writer_pixel_repeater.io.resp.valid && !zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer_pixel_repeater.io.resp.bits.laddr.sp_bank() === i.U &&
+          // !((mvin_scale_out.valid && mvin_scale_out.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+          !((mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last)) &&
+          bio.write.ready
+
+        bio.write.valid := exwrite || dmaread || zerowrite
+
+        when (exwrite) {
+          bio.write.addr := io.srams.write(i).addr
+          bio.write.data := io.srams.write(i).data
+          bio.write.mask := io.srams.write(i).mask
+        }.elsewhen (dmaread) {
+          bio.write.addr := laddr.sp_row()
+          bio.write.data := mvin_scale_pixel_repeater.io.resp.bits.out.asUInt
+          bio.write.mask := mvin_scale_pixel_repeater.io.resp.bits.mask take ((spad_w / (aligned_to * 8)) max 1)
+
+          mvin_scale_pixel_repeater.io.resp.ready := true.B // TODO we combinationally couple valid and ready signals
+        }.elsewhen (zerowrite) {
+          bio.write.addr := zero_writer_pixel_repeater.io.resp.bits.laddr.sp_row()
+          bio.write.data := 0.U
+          bio.write.mask := zero_writer_pixel_repeater.io.resp.bits.mask
+
+          zero_writer_pixel_repeater.io.resp.ready := true.B // TODO we combinationally couple valid and ready signals
+        }.otherwise {
+          bio.write.addr := DontCare
+          bio.write.data := DontCare
+          bio.write.mask := DontCare
+        }
+      }
+      banks
+    }
+
+    val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
+    val spad_row_t = Vec(meshColumns, Vec(tileColumns, inputType))
+
+    val (acc_norm_unit_in, acc_norm_unit_out) = Normalizer(
+      is_passthru = !config.has_normalizations,
+      max_len = block_cols,
+      num_reduce_lanes = -1,
+      num_stats = 2,
+      latency = 4,
+      fullDataType = acc_row_t,
+      scale_t = acc_scale_t,
+    )
+
+    acc_norm_unit_in.valid := false.B
+    acc_norm_unit_in.bits.len := write_norm_q.io.deq.bits.len
+    acc_norm_unit_in.bits.stats_id := write_norm_q.io.deq.bits.acc_norm_stats_id
+    acc_norm_unit_in.bits.cmd := write_norm_q.io.deq.bits.laddr.norm_cmd
+    acc_norm_unit_in.bits.acc_read_resp := DontCare
+
+    val acc_scale_unit = Module(new AccumulatorScale(
+      acc_row_t,
+      spad_row_t,
+      acc_scale_t.asInstanceOf[V],
+      acc_read_small_width,
+      acc_read_full_width,
+      acc_scale_func,
+      acc_scale_num_units,
+      acc_scale_latency,
+      has_nonlinear_activations,
+      has_normalizations,
+    ))
+
+    val acc_waiting_to_be_scaled = write_scale_q.io.deq.valid &&
+      !write_scale_q.io.deq.bits.laddr.is_garbage() &&
+      write_scale_q.io.deq.bits.laddr.is_acc_addr &&
+      write_issue_q.io.enq.ready
+
+    acc_norm_unit_out.ready := acc_scale_unit.io.in.ready && acc_waiting_to_be_scaled
+    acc_scale_unit.io.in.valid := acc_norm_unit_out.valid && acc_waiting_to_be_scaled
+    acc_scale_unit.io.in.bits  := acc_norm_unit_out.bits
+
+    when (acc_scale_unit.io.in.fire) {
+      write_issue_q.io.enq <> write_scale_q.io.deq
+    }
+
+    acc_scale_unit.io.out.ready := false.B
+
+    val dma_resp_ready =
+      (writer.module.io.req.ready && spad_writer.map(_.module.io.req.ready).getOrElse(true.B)) &&
+        write_issue_q.io.deq.bits.laddr.is_acc_addr &&
+        !write_issue_q.io.deq.bits.laddr.is_garbage()
+
+    when (acc_scale_unit.io.out.bits.fromDMA && dma_resp_ready) {
+      // Send the acc-scale result into the DMA
+      acc_scale_unit.io.out.ready := true.B
+      writeData.valid := acc_scale_unit.io.out.valid
+      writeData.bits  := acc_scale_unit.io.out.bits.data.asUInt
+      fullAccWriteData := acc_scale_unit.io.out.bits.full_data.asUInt
+    }
+    for (i <- 0 until acc_banks) {
+      // Send the acc-sccale result to the ExController
+      io.acc.read_resp(i).valid := false.B
+      io.acc.read_resp(i).bits  := acc_scale_unit.io.out.bits
+      when (!acc_scale_unit.io.out.bits.fromDMA && acc_scale_unit.io.out.bits.acc_bank_id === i.U) {
+        acc_scale_unit.io.out.ready := io.acc.read_resp(i).ready
+        io.acc.read_resp(i).valid := acc_scale_unit.io.out.valid
       }
     }
 
-    // -------------------------
-    // WRITING: multi-cycle write
-    // -------------------------
-    is(writing) {
-      when(writeCounter === 0.U) {
-        state := idle
-      }.otherwise {
-        writeCounter := writeCounter - 1.U
+    val acc_adders = Module(new AccPipeShared(acc_latency-1, acc_row_t, acc_banks))
+
+    val acc_mems = {
+      val banks = Seq.fill(acc_banks) { Module(new AccumulatorMem(
+        acc_bank_entries, acc_row_t, acc_scale_func, acc_scale_t.asInstanceOf[V],
+        acc_singleported, acc_sub_banks,
+        use_shared_ext_mem, use_tl_ext_mem,
+        acc_latency, accType, is_dummy
+      )) }
+      val bank_ios = VecInit(banks.map(_.io))
+
+      // Getting the output of the bank that's about to be issued to the writer
+      val bank_issued_io = bank_ios(write_issue_q.io.deq.bits.laddr.acc_bank())
+
+      // Reading from the Accumulator banks
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
+        if (use_shared_ext_mem) {
+          io.ext_mem.get.acc(i) <> bio.ext_mem.get
+        }
+
+        acc_adders.io.in_sel(i) := bio.adder.valid
+        acc_adders.io.ina(i) := bio.adder.op1
+        acc_adders.io.inb(i) := bio.adder.op2
+        bio.adder.sum := acc_adders.io.out
+
+        val ex_read_req = io.acc.read_req(i)
+        val exread = ex_read_req.valid
+
+        // TODO we tie the write dispatch queue's, and write issue queue's, ready and valid signals together here
+        val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
+          !write_dispatch_q.bits.laddr.is_garbage() &&
+          write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.acc_bank() === i.U
+
+        bio.read.req.valid := exread || dmawrite
+        ex_read_req.ready := bio.read.req.ready
+
+        // The ExecuteController gets priority when reading from accumulator banks
+        when (exread) {
+          bio.read.req.bits.addr := ex_read_req.bits.addr
+          bio.read.req.bits.act := ex_read_req.bits.act
+          bio.read.req.bits.igelu_qb := ex_read_req.bits.igelu_qb
+          bio.read.req.bits.igelu_qc := ex_read_req.bits.igelu_qc
+          bio.read.req.bits.iexp_qln2 := ex_read_req.bits.iexp_qln2
+          bio.read.req.bits.iexp_qln2_inv := ex_read_req.bits.iexp_qln2_inv
+          bio.read.req.bits.scale := ex_read_req.bits.scale
+          bio.read.req.bits.full := false.B
+          bio.read.req.bits.fromDMA := false.B
+        }.elsewhen (dmawrite) {
+          bio.read.req.bits.addr := write_dispatch_q.bits.laddr.acc_row()
+          bio.read.req.bits.full := write_dispatch_q.bits.laddr.read_full_acc_row
+          bio.read.req.bits.act := write_dispatch_q.bits.acc_act
+          bio.read.req.bits.igelu_qb := write_dispatch_q.bits.acc_igelu_qb.asTypeOf(bio.read.req.bits.igelu_qb)
+          bio.read.req.bits.igelu_qc := write_dispatch_q.bits.acc_igelu_qc.asTypeOf(bio.read.req.bits.igelu_qc)
+          bio.read.req.bits.iexp_qln2 := write_dispatch_q.bits.acc_iexp_qln2.asTypeOf(bio.read.req.bits.iexp_qln2)
+          bio.read.req.bits.iexp_qln2_inv := write_dispatch_q.bits.acc_iexp_qln2_inv.asTypeOf(bio.read.req.bits.iexp_qln2_inv)
+          bio.read.req.bits.scale := write_dispatch_q.bits.acc_scale.asTypeOf(bio.read.req.bits.scale)
+          bio.read.req.bits.fromDMA := true.B
+
+          when (bio.read.req.fire) {
+            write_dispatch_q.ready := true.B
+            write_norm_q.io.enq.valid := true.B
+
+            io.dma.write.resp.valid := true.B
+          }
+        }.otherwise {
+          bio.read.req.bits := DontCare
+        }
+        bio.read.resp.ready := false.B
+
+        when (write_norm_q.io.deq.valid &&
+          acc_norm_unit_in.ready &&
+          bio.read.resp.valid &&
+          write_scale_q.io.enq.ready &&
+          write_norm_q.io.deq.bits.laddr.is_acc_addr &&
+          !write_norm_q.io.deq.bits.laddr.is_garbage() &&
+          write_norm_q.io.deq.bits.laddr.acc_bank() === i.U)
+        {
+          write_norm_q.io.deq.ready := true.B
+          acc_norm_unit_in.valid := true.B
+          bio.read.resp.ready := true.B
+
+          // Some normalizer commands don't write to main memory, so they don't need to be passed on to the scaling units
+          write_scale_q.io.enq.valid := NormCmd.writes_to_main_memory(write_norm_q.io.deq.bits.laddr.norm_cmd)
+
+          acc_norm_unit_in.bits.acc_read_resp := bio.read.resp.bits
+          acc_norm_unit_in.bits.acc_read_resp.acc_bank_id := i.U
+        }
       }
+
+      // Writing to the accumulator banks
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
+        // Order of precedence during writes is ExecuteController, and then mvin_scale, and then mvin_scale_acc, and
+        // then zero_writer
+
+        val exwrite = io.acc.write(i).valid
+        io.acc.write(i).ready := true.B
+        assert(!(exwrite && !bio.write.ready), "Execute controller write to AccumulatorMem was skipped")
+
+        // val from_mvin_scale = mvin_scale_out.valid && mvin_scale_out.bits.tag.is_acc
+        val from_mvin_scale = mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc
+        val from_mvin_scale_acc = mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.tag.is_acc
+
+        // val mvin_scale_laddr = mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
+        val mvin_scale_laddr = mvin_scale_pixel_repeater.io.resp.bits.laddr
+        val mvin_scale_acc_laddr = mvin_scale_acc_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_acc_out.bits.row
+
+        val dmaread_bank = Mux(from_mvin_scale, mvin_scale_laddr.acc_bank(),
+          mvin_scale_acc_laddr.acc_bank())
+        val dmaread_row = Mux(from_mvin_scale, mvin_scale_laddr.acc_row(), mvin_scale_acc_laddr.acc_row())
+
+        // We need to make sure that we don't try to return a dma read resp from both mvin_scale and mvin_scale_acc
+        // at the same time. mvin_scale always gets priority in this cases
+        val spad_last = mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last && !mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc
+
+        val dmaread = (from_mvin_scale || from_mvin_scale_acc) &&
+          dmaread_bank === i.U /* &&
+          (mvin_scale_same.B || from_mvin_scale || !spad_dmaread_last) */
+
+        // We need to make sure that we don't try to return a dma read resp from both zero_writer and either mvin_scale
+        // or mvin_acc_scale at the same time. The scalers always get priority in those cases
+        /* val zerowrite = zero_writer.io.resp.valid && zero_writer.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer.io.resp.bits.laddr.acc_bank() === i.U && */
+        val zerowrite = zero_writer_pixel_repeater.io.resp.valid && zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer_pixel_repeater.io.resp.bits.laddr.acc_bank() === i.U &&
+          // !((mvin_scale_out.valid && mvin_scale_out.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+          !((mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+
+        val consecutive_write_block = RegInit(false.B)
+        if (acc_singleported) {
+          val consecutive_write_sub_bank = RegInit(0.U((1 max log2Ceil(acc_sub_banks)).W))
+          when (bio.write.fire && bio.write.bits.acc &&
+            (bio.write.bits.addr(log2Ceil(acc_sub_banks)-1,0) === consecutive_write_sub_bank)) {
+            consecutive_write_block := true.B
+          } .elsewhen (bio.write.fire && bio.write.bits.acc) {
+            consecutive_write_block := false.B
+            consecutive_write_sub_bank := bio.write.bits.addr(log2Ceil(acc_sub_banks)-1,0)
+          } .otherwise {
+            consecutive_write_block := false.B
+          }
+        }
+        bio.write.valid := false.B
+
+        // bio.write.bits.acc := MuxCase(zero_writer.io.resp.bits.laddr.accumulate,
+        bio.write.bits.acc := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.accumulate,
+          Seq(exwrite -> io.acc.write(i).bits.acc,
+            // from_mvin_scale -> mvin_scale_out.bits.tag.accumulate,
+            from_mvin_scale -> mvin_scale_pixel_repeater.io.resp.bits.tag.accumulate,
+            from_mvin_scale_acc -> mvin_scale_acc_out.bits.tag.accumulate))
+
+        // bio.write.bits.addr := MuxCase(zero_writer.io.resp.bits.laddr.acc_row(),
+        bio.write.bits.addr := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.acc_row(),
+          Seq(exwrite -> io.acc.write(i).bits.addr,
+            (from_mvin_scale || from_mvin_scale_acc) -> dmaread_row))
+
+        when (exwrite) {
+          bio.write.valid := true.B
+          bio.write.bits.data := io.acc.write(i).bits.data
+          bio.write.bits.mask := io.acc.write(i).bits.mask
+        }.elsewhen (dmaread && !spad_last && !consecutive_write_block) {
+          bio.write.valid := true.B
+          bio.write.bits.data := Mux(from_mvin_scale,
+            // VecInit(mvin_scale_out.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
+            VecInit(mvin_scale_pixel_repeater.io.resp.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
+            mvin_scale_acc_out.bits.out.asTypeOf(acc_row_t))
+          bio.write.bits.mask :=
+            Mux(from_mvin_scale,
+              {
+                val n = accType.getWidth / inputType.getWidth
+                // val mask = mvin_scale_out.bits.tag.mask take ((spad_w / (aligned_to * 8)) max 1)
+                val mask = mvin_scale_pixel_repeater.io.resp.bits.mask take ((spad_w / (aligned_to * 8)) max 1)
+                val expanded = VecInit(mask.flatMap(e => Seq.fill(n)(e)))
+                expanded
+              },
+              mvin_scale_acc_out.bits.tag.mask)
+
+          when(from_mvin_scale) {
+            mvin_scale_pixel_repeater.io.resp.ready := bio.write.ready
+          }.otherwise {
+            mvin_scale_acc_out.ready := bio.write.ready
+          }
+        }.elsewhen (zerowrite && !spad_last && !consecutive_write_block) {
+          bio.write.valid := true.B
+          bio.write.bits.data := 0.U.asTypeOf(acc_row_t)
+          bio.write.bits.mask := {
+            val n = accType.getWidth / inputType.getWidth
+            val mask = zero_writer_pixel_repeater.io.resp.bits.mask
+            val expanded = VecInit(mask.flatMap(e => Seq.fill(n)(e)))
+            expanded
+          }
+
+          zero_writer_pixel_repeater.io.resp.ready := bio.write.ready
+        }.otherwise {
+          bio.write.bits.data := DontCare
+          bio.write.bits.mask := DontCare
+        }
+      }
+      banks
     }
+
+    // Counter connection
+    io.counter := DontCare
+    io.counter.collect(reader.module.io.counter)
+    io.counter.collect(writer.module.io.counter)
+    spad_writer.foreach(_.module.io.counter := DontCare)
+//    io.counter.collect(spad_writer.module.io.counter)
   }
 }
 
+/*
+object GatedDiodeMem {
+  def apply(n: Int, w: Int, mask_len: Int, readLatency: Int, writeLatency: Int)(implicit m: Module) = {
+    val mem = Module(new GatedDiodeMemModule(n, w, mask_len, readLatency, writeLatency))
+    new GatedDiodeMemHandle(mem)
+  }
+}
+*/
 
-class GatedDiodeMem(val n: Int, val w: Int) extends Module {
+//My version with adjusted class behavior
+//class GatedDiodeMem(n: Int, w: Int, readLatency: Int, writeLatency: Int)
+
+class GatedDiodeMemModule(
+  val n: Int,
+  val w: Int,
+  val mask_len: Int,
+  val mask_elem: Data,
+  val readLatency: Int,
+  val writeLatency: Int
+) extends Module 
+{
+  val addrWidth = log2Ceil(n)
+
   val io = IO(new Bundle {
-    // Requests
-    val ren    = Input(Bool())
-    val raddr  = Input(UInt(log2Ceil(n).W))
+    //Read Request
+    val rreq = Flipped(Decoupled(new Bundle {
+      val addr = UInt(addrWidth.W)
+    }))
+    //Read Response
+    val rresp = Decoupled(new Bundle {
+      val data = Vec(mask_len, mask_elem.cloneType)
+    })
 
-    val wen    = Input(Bool())
-    val waddr  = Input(UInt(log2Ceil(n).W))
-    val wdata  = Input(UInt(w.W))
-
-    // Outputs
-    val rdata  = Output(UInt(w.W))
-    val rvalid = Output(Bool())
-    val busy   = Output(Bool())
+    //Write Request
+    val wreq = Flipped(Decoupled(new Bundle {
+      val addr = UInt(addrWidth.W)
+      val data = Vec(mask_len, mask_elem.cloneType)
+      val mask = Vec(mask_len, Bool())
+    }))
   })
 
-  // -----------------------------------------
-  // Internal storage (behavioral model only)
-  // -----------------------------------------
-  val mem = Reg(Vec(n, UInt(w.W)))
+  //val mem = SyncReadMem(n, Vec(mask_len, UInt(w.W)))
+  val mem = SyncReadMem(n, Vec(mask_len, mask_elem.cloneType))
 
-  // FSM States
-  val sIdle     :: sPrecharge :: sActivate :: sSense :: sRestore :: sWriteCycle :: Nil = Enum(6)
-  val state = RegInit(sIdle)
 
-  val savedAddr  = Reg(UInt(log2Ceil(n).W))
-  val savedWrite = Reg(Bool())
-  val savedData  = Reg(UInt(w.W))
+  io.wreq.ready := true.B //accept every write for now and implement pipelining later
 
-  // Output defaults
-  io.rdata  := 0.U
-  io.rvalid := false.B
-  io.busy   := (state =/= sIdle)
+  when (io.wreq.fire) {
+    mem.write(io.wreq.bits.addr, io.wreq.bits.data, io.wreq.bits.mask)
+  }
 
-  // -----------------------------------------
-  // FSM Logic
-  // -----------------------------------------
-  switch(state) {
+  //readpipes
+  val raddrPipe  = RegInit(VecInit(Seq.fill(readLatency)(0.U(addrWidth.W))))
+  val rvalidPipe = RegInit(VecInit(Seq.fill(readLatency)(false.B)))
 
-    is(sIdle) {
-      when(io.ren) {
-        savedAddr := io.raddr
-        state := sPrecharge
-      }.elsewhen(io.wen) {
-        savedAddr := io.waddr
-        savedData := io.wdata
-        savedWrite := true.B
-        state := sWriteCycle
+  //writepipes
+  val waddrPipe  = RegInit(VecInit(Seq.fill(readLatency)(0.U(addrWidth.W))))
+  val wdataPipe  = Reg(Vec(writeLatency, Vec(mask_len, mask_elem.cloneType)))
+  val wvalidPipe = RegInit(VecInit(Seq.fill(readLatency)(false.B)))
+  val wmaskPipe  = Reg(Vec(writeLatency, Vec(mask_len, Bool())))
+
+  when (io.wreq.fire) {
+    waddrPipe(0)  := io.wreq.bits.addr
+    wdataPipe(0)  := io.wreq.bits.data
+    wmaskPipe(0)  := io.wreq.bits.mask
+    wvalidPipe(0) := true.B
+  } .otherwise {
+    wvalidPipe(0) := false.B
+  }
+
+  for (i <- 1 until writeLatency) {
+    waddrPipe(i)  := waddrPipe(i-1)
+    wdataPipe(i)  := wdataPipe(i-1)
+    wmaskPipe(i)  := wmaskPipe(i-1)
+    wvalidPipe(i) := wvalidPipe(i-1)  
+  }
+
+  when (wvalidPipe(writeLatency-1)) {
+    mem.write(waddrPipe(writeLatency-1), wdataPipe(writeLatency-1), wmaskPipe(writeLatency-1))
+  }
+  
+  //state logic
+  val sIdle :: sReadStart :: sWait :: sResp :: Nil = Enum(4) 
+  val state = RegInit(sIdle) 
+
+  val addrReg = Reg(UInt(addrWidth.W)) 
+  val cnt = RegInit(0.U(log2Ceil(readLatency max 1).W)) 
+  val dataReg = Reg(Vec(mask_len, mask_elem.cloneType))
+
+  io.rreq.ready := false.B
+  io.rresp.valid := false.B
+
+  /*
+  val forwardingHit = io.wreq.fire && (io.wreq.bits.addr === addrReg)
+  val forwardedData = io.wreq.bits.data
+  
+  val finalData = Wire(Vec(mask_len, mask_elem.cloneType)) //maybe change these to wires?
+  
+  when (forwardingHit) {
+    finalData := forwardedData
+  } .otherwise {
+    finalData := dataReg
+  }
+
+  io.rresp.bits.data := finalData
+  */
+  io.rresp.bits.data := dataReg
+
+  val memOut = mem.read(addrReg, state === sReadStart)
+
+  switch (state) 
+  {
+    is (sIdle) 
+    {
+      io.rreq.ready := true.B
+      when(io.rreq.fire) {
+        addrReg := io.rreq.bits.addr
+        //memOut := mem.read(io.rreq.bits.addr, true.B)
+        state := sReadStart
+        //state := sWait
+        //cnt := 0.U
+      }
+    }
+    
+    is(sReadStart) 
+    {
+      //memOut  := mem.read(addrReg, true.B)
+      //dataReg := memOut
+      cnt := 0.U
+      state := sWait
+    }
+    
+    is (sWait)
+    {
+      when (cnt === 0.U){
+        dataReg := memOut
+      }
+      when (cnt === (readLatency-1).U) {
+        state := sResp
+      } .otherwise {
+        cnt := cnt + 1.U
       }
     }
 
-    // READ PHASES
-    is(sPrecharge) {
-      // 1 cycle precharge
-      state := sActivate
-    }
-
-    is(sActivate) {
-      // 1 cycle wordline activation
-      state := sSense
-    }
-
-    is(sSense) {
-      // 1 cycle sensing
-      io.rdata := mem(savedAddr)
-      io.rvalid := true.B
-
-      // destructive read? If so, clear or corrupt cell
-      // mem(savedAddr) := 0.U    // uncomment if needed
-
-      state := sRestore
-    }
-
-    is(sRestore) {
-      // restore original cell value (or after correction)
-      // mem(savedAddr) := mem(savedAddr) // simulate restore latency
-      state := sIdle
-    }
-
-    // WRITE PHASE
-    is(sWriteCycle) {
-      mem(savedAddr) := savedData
-      state := sIdle
-    }
-  }
-}
-
-
-
-class GatedDiodeMem(val n: Int, val w: Int,
-                    val readLatency: Int = 3,
-                    val writeLatency: Int = 4,
-                    val destructiveRead: Boolean = true)
-  extends Module {
-
-  val io = IO(new Bundle {
-    // READ
-    val raddr  = Input(UInt(log2Ceil(n).W))
-    val ren    = Input(Bool())
-    val rvalid = Output(Bool())
-    val rdata  = Output(UInt(w.W))
-
-    // WRITE
-    val waddr  = Input(UInt(log2Ceil(n).W))
-    val wen    = Input(Bool())
-    val wdata  = Input(UInt(w.W))
-    val wready = Output(Bool())
-
-    // BUSY (stall Gemmini)
-    val busy = Output(Bool())
-  })
-
-  // ------------------------------------------------------------------------
-  // 1. Underlying memory array
-  // ------------------------------------------------------------------------
-  val mem = Reg(Vec(n, UInt(w.W)))
-
-  // Store data early for functional correctness
-  // System-level visibility will be delayed by writeLatency cycles.
-  when(io.wen && io.wready) {
-    mem(io.waddr) := io.wdata
-  }
-
-  // ------------------------------------------------------------------------
-  // 2. Device timing model
-  // ------------------------------------------------------------------------
-  val readPipe  = RegInit(VecInit(Seq.fill(readLatency)(false.B)))
-  val writePipe = RegInit(VecInit(Seq.fill(writeLatency)(false.B)))
-
-  val readAddrPipe  = Reg(Vec(readLatency, UInt(log2Ceil(n).W)))
-  val readDataPipe  = Reg(Vec(readLatency, UInt(w.W)))
-
-  val writeActive   = writePipe.reduce(_||_)
-  val readActive    = readPipe.reduce(_||_)
-
-  io.busy := (writeActive || readActive)
-  io.wready := !writeActive   // can't accept a new write while writing
-
-  // ------------------------------------------------------------------------
-  // 3. READ OPERATION
-  // ------------------------------------------------------------------------
-  io.rvalid := readPipe.last
-  io.rdata  := readDataPipe.last
-
-  when(io.ren && !writeActive && !readActive) {
-    // Start read timing
-    readPipe(0) := true.B
-
-    // Captured read data for pipelining
-    readAddrPipe(0) := io.raddr
-    readDataPipe(0) := mem(io.raddr)
-
-    // Optional destructive read: write back original value later
-    when (destructiveRead) {
-      mem(io.raddr) := mem(io.raddr)  // to be expanded with restore timing
+    is (sResp)
+    {
+      io.rresp.valid := true.B
+      when (io.rresp.fire) {
+        state := sIdle
+      }
     }
   }
 
-  // Shift read pipeline
+  /*
+  when(io.rreq.fire) {
+    raddrPipe(0) := io.rreq.bits.addr
+    rvalidPipe(0) := true.B
+  }
+
   for (i <- 1 until readLatency) {
-    readPipe(i) := readPipe(i-1)
-    readAddrPipe(i) := readAddrPipe(i-1)
-    readDataPipe(i) := readDataPipe(i-1)
+    when (!rvalidPipe(i)) {
+      raddrPipe(i) := raddrPipe(i - 1)
+      rvalidPipe(i) := rvalidPipe(i-1)
+      rvalidPipe(i-1) := false.B
+    }
+  }
+  
+
+
+  val lastStageVal = rvalidPipe(readLatency - 1)
+  val lastStageAddr = raddrPipe(readLatency - 1)
+
+  val forwardingHit = io.wreq.fire && (io.wreq.bits.addr === lastStageAddr) 
+  val forwardedData = io.wreq.bits.data
+  
+  val memData = mem.read(lastStageAddr, (lastStageVal && !forwardingHit))
+  val respData = Wire(Vec(mask_len, UInt(w.W)))
+
+  when (forwardingHit) {
+    respData := forwardedData
+  } .otherwise {
+    respData := memData
   }
 
-  when(!io.ren) {
-    readPipe(0) := false.B
-  }
+  io.rresp.bits.data := respData
+  io.rresp.valid := lastStageVal
 
-  // ------------------------------------------------------------------------
-  // 4. WRITE OPERATION
-  // ------------------------------------------------------------------------
-  // Initiate write cycle
-  when(io.wen && io.wready) {
-    writePipe(0) := true.B
+  when(io.rresp.fire) {
+    rvalidPipe(readLatency-1) := false.B
   }
-
-  // Shift write pipeline
-  for(i <- 1 until writeLatency) {
-    writePipe(i) := writePipe(i-1)
-  }
-
-  when(!io.wen) {
-    writePipe(0) := false.B
-  }
+  */
 }
 
-
+/*
 //My version
-class GatedDiodeMemModule(val n: Int, val w: Int)
-extends module{
+class GatedDiodeMemModule(val n: Int, val w: Int, val mask_len: Int, val readLatency: Int, val writeLatency: Int)
+extends Module{
     val io = IO(new Bundle 
     {   
-        val nonVol input(Bool()) //value for defining whether read/write will be nv or v
-
         ///////////////////
         //reading signals//
         ///////////////////
-        val ren    input(Bool())  //read enable signal
-        val raddr  input(log2Ceil(n).W)  //data address to read from
-        val rdata  output(UInt(w.W)) //data that was read from memory
-        val rvalid output(Bool()) //tells signal whether read was valid or not
+        val ren    = Input(Bool())  //read enable signal
+        val raddr  = Input(UInt(log2Ceil(n).W))  //data address to read from
+        val rdata  = Output(Vec(mask_len, UInt(w.W))) //data that was read from memory
+        val rvalid = Output(Bool()) //tells signal whether read was valid or not
         
         ///////////////////
         //writing signals//
         ///////////////////
-        val wen    input(Bool()) //write enable signal
-        val waddr  input(log2Ceil(n).W) //data address to write to
-        val wdata  input(UInt(w.W)) //data to write to address
-        val wready output(Bool()) //signals whether or not a write is currently happening
-        
-        //note1:
-        //the log2Ceil.W is a little bit confusing here, since n is our data size we need log2(n) bits to index it
-        //the .W afterwards is not associated with our input w, it's just a chisel literal for affirming bit width
-
-        val busy output(Bool())
-
-        //note2:
-        //gemminis scratch pad is dual ported, meaning that it
-        //can actually read and write at the same time, meaning that
-        //you need to differentiate between when the signal is busy reading
-        //and when signal is busy writing
-        //we still have a single busy signal though as well to communicate
-        //when it is reading so we can keep it as a status bit
+        val wen    = Input(Bool()) //write enable signal
+        val waddr  = Input(UInt(log2Ceil(n).W)) //data address to write to
+        val wmask  = Input(Vec(mask_len, Bool()))
+        val wdata  = Input(Vec(mask_len, UInt(w.W))) //data to write to address
+        val wready = Output(Bool()) //signals whether or not a write is currently happening
+    
+        val busy = Output(Bool())
     })
 
-    //our actual memory in the behavorial model will be represented
-    //as basically just an array of registers
-    //the actual hardware of this would be a large assortment of flip flops
-    val mem = (Vec(n, UInt(w.W))) //n is number of entries, so size of memory
-                     //w is the bit width of each memory entry
-
-    val readLatency  = Uint()
-    val writeLatency = Uint()
-
-    when(nonVol)
-    {
-        readLatency = 4//latency of our non-volatile reads
-        writeLatency = 8//latency of our non-volatile writes
-    }
-    .otherwise
-    {
-        readLatency = 1 //latency of our non-volatile reads
-        writeLatency = 1//latency of our non-volatile writes
-    }
+    require(readLatency >= 1, "readLatency must be >= 1")
+    require(writeLatency >= 1, "writeLatency must be >= 1")
+    
+    //io.wready := false.B
+    //io.rdata  := VecInit(Seq.fill(mask_len)(0.U(w.W)))
+    //io.rvalid := false.B
+    //io.busy   := false.B
+      
+    val mem = SyncReadMem(n, Vec(mask_len, UInt(w.W)))
 
     //instantiate
-    val readpipe     = RegInit(VecInit(Seq.fill(readLatency)(false.B))) //this is a pipe where we'll store our rvalid, when it reaches the end the data read will be marked valid
-    val writePipe    = RegInit(VecInit(Seq.fill(writeLatency)(false.B)))//this is just a stall pipe so the system has time to write
- 
-    val readAddrPipe = Reg(Vec(readLatency,Uint(log2Ceil(n).W))) //We will store the read addr in this pipe and when the system has stalled the appropriate time we'll use the read addr in it
-    val readDataPipe = Reg(Vec(readLatency,Uint(w.W)))//Similar story to addrpipe but with the data instead
+    /*
+    val readpipe     = RegInit(VecInit(Seq.fill(readLatency)(false.B)))
+    val raddrPipe = RegInit(VecInit(Seq.fill(readLatency)(0.U(log2Ceil(n).W))))
+    val readDataPipe = RegInit(VecInit(Seq.fill(readLatency)(VecInit(Seq.fill(mask_len)(0.U(w.W))))))
 
-    //when we begin to read or write we will store a 1 in the read or write pipes
-    //the 1 will be there to mark when the pipe has reached its end
-    //the 1 also serves as a sign that the system is active
-    //if we see a 1 anywhere in the pipe that means its busy
-    //these functions are just oring all values of the pipeline together
-    val readActive   = readpipe.reduce(_||_)
-    val writeActive  = writepipe.reduce(_||_)
+    val waddrPipe = RegInit(VecInit(Seq.fill(writeLatency)(0.U(log2Ceil(n).W))))
+    val wdataPipe = RegInit(VecInit(Seq.fill(writeLatency)(VecInit(Seq.fill(mask_len)(0.U(w.W))))))
+    val wmaskPipe = RegInit(VecInit(Seq.fill(writeLatency)(VecInit(Seq.fill(mask_len)(false.B)))))
+    val writepipe    = RegInit(VecInit(Seq.fill(writeLatency)(false.B)))
+    
+    //val readActive  = readpipe.asUInt.orR
+    //val writeActive = writepipe.asUInt.orR
 
-    wready := !writeActive
-    busy := (writeActive || readActive)
+    //io.wready := !writeActive
+    
+    //io.busy := readActive || writeActive
+    */
+
+    //////////////////
+    ////WRITE LOGIC////
+    //////////////////
+    val wenShift   = ShiftRegister(io.wen, writeLatency)
+    val waddrShift = ShiftRegister(io.waddr, writeLatency)
+    val wdataShift   = ShiftRegister(io.wdata, writeLatency)
+    val wmaskShift   = ShiftRegister(io.wmask, writeLatency)
+
+    when (wenShift) {
+      mem.write(waddrShift, wdataShift, wmaskShift)
+    }
+    /*
+    writepipe(0) := io.wen
+
+    when (io.wen) {
+      //writepipe(0) := true.B
+      waddrPipe(0) := io.waddr
+      wdataPipe(0) := io.wdata
+      wmaskPipe(0) := io.wmask
+    }
+    
+    //above: storing the values we need in the 0 spot of the pipes
+    //if wen is high then we set a true so that we know we should be shifting
+    //if wen is low it's set to false so we know not to shift
+
+    //shifting the writing pipeline every cycle but only if the shifting
+    //flag register says to do so
+    for (i <- 1 until writeLatency) {
+      writepipe(i) := writepipe(i-1)
+      when(writepipe(i-1)) {
+        //writepipe(i) := true.B
+        waddrPipe(i) := waddrPipe(i-1)
+        wdataPipe(i) := wdataPipe(i-1)
+        wmaskPipe(i) := wmaskPipe(i-1)
+      }
+      //.otherwise {
+      //  writepipe(i) := false.B
+      //}
+    }
+
+    when (writepipe(writeLatency-1)) {
+      mem.write(
+        waddrPipe(writeLatency-1),
+        wdataPipe(writeLatency-1),
+        wmaskPipe(writeLatency-1)
+      )
+    }
+
+  val writeActive = writepipe.asUInt.orR
+  */
+  //////////////////
+  ////READ LOGIC////
+  //////////////////
+  val intData = Reg(Vec(mask_len, UInt(w.W)))
+
+  val renShift = ShiftRegister(io.ren, readLatency)
+  val raddrShift = ShiftRegister(io.raddr, readLatency)
+
+  val memOut = mem.read(raddrShift, renShift)
+
+  when(renShift) {
+    intData := memOut //need next cycle because syncreadmem takes one cycle for data to be read
+  }
+
+  io.rdata := intData
+  io.rvalid := RegNext(io.ren)
+
+
+  io.wready := true.B
+  //io.wready := !writeActive
+  io.busy := false.B
+}
+*/
 
 
     //////////////////
     ////READ LOGIC////
     //////////////////
-    //if we call a read and the system isn't already busy
-    if(iren && !busy)
-    {
-        readpipe(0)     := true.B
-        readAddrPipe(0) := io.raddr 
-        //we want to move raddr through the pipeline as insurance basically, in case we need the check the address the rdata came from and they get dysnced somehow
-        readDataPipe(0) := mem(io.raddr)  
+    //when (io.ren && !writeActive) {
+    /*
+    readpipe(0) := (io.ren) && (!readActive)
+    raddrPipe(0) := io.raddr
+
+    for (i <- 1 until readLatency) {
+      readpipe(i)  := readpipe(i-1)
+      raddrPipe(i) := raddrPipe(i-1)
     }
 
-    //Set output values to equal value at the end of pipeline
-    //when we're done counting our desired data will be in this spot if successful
-    io.rdata  := readDataPipe(last)
-    io.rvalid := readpipe(last)
+    // Perform the actual memory read ONLY at the final stage
+    //val memReadData = mem.read(
+    //  raddrPipe(readLatency-1),
+    //  readpipe(readLatency-1)
+    //)
+    val rdataReg = Reg(Vec(mask_len, UInt(w.W)))
+    when (readpipe(readLatency-1)) {
+      rdataReg := mem.read(raddrPipe(readLatency-1), readpipe(readLatency-1))
+    }
 
-    //Starting at 1, iterate i in loop until it reaches value of readLatency
-    //we want to shift the values of the pipe over 1 every iteration essentially
-    //we shift the values in the pipe until the value stored initially at 0 gets to the last stage 
+    //io.rdata  := readDataPipe(readLatency-1)
+    io.rdata := RegNext(rdataReg)
+    val rvalidReg = RegNext(RegNext(RegNext(readpipe(readLatency-1), init=false.B), init=false.B), init=false.B)
+    io.rvalid := rvalidReg
+    if(readpipe(readLatency - 1)) {
+      RegNext(readpipe(readLatency - 1)) 
+    }
+    //io.rvalid := readpipe(readLatency-1)
+    //val rvalidReg = RegNext(RegNext(readpipe(readLatency-1), init=false.B), init=false.B)
+    */
+
+    /*
+    val memOut = mem.read(io.raddr, io.ren)
+
+    for(i <- 0 until (readLatency-1))
+    {
+      if(i == 0) {
+        when(io.ren) {
+          readpipe(0) := true.B
+          raddrPipe(0) := io.raddr
+        }
+        .otherwise {
+          readpipe(0) := false.B
+        }
+      }
+      else {
+        readpipe(i)  := readpipe(i-1)
+        raddrPipe(i) := raddrPipe(i-1)
+        //readDataPipe(i) := readDataPipe(i-1)
+      }
+    }
+
+    readDataPipe(readLatency-1) := memOut
+
+    io.rvalid := readpipe(readLatency - 1)
+    io.rdata := readDataPipe(readLatency - 1)
+}
+*/
+/*
+    for (i <- 0 until (readLatency)) {
+      if(i == 0){
+        when(readpipe(0)) {
+          readDataPipe := memOut
+        }
+      }
+      else if(i == 1){
+        when(readpipe(1)) {
+          readDataPipe(i) := memOut
+          readpipe(1) := readpipe(0)
+        }
+      }
+      else {
+        when(readpipe(i-1)) {
+          readpipe(i) := readpipe(i-1)
+          //raddrPipe(i) := raddrPipe(i-1)
+          readDataPipe(i) := readDataPipe(i-1)
+        }
+      }
+      //.otherwise {
+      //  readpipe(i) := false.B
+      //}
+    }
+*/
+
+    //when (readpipe(readLatency-1)) {
+      //mem.read(raddrPipe(readLatency-1),(io.ren && !writeActive))
+      //io.rvalid := true.B
+      //io.rdata := readDataPipe(readLatency - 1)
+    //}
+
+    /*
+    readpipe(0) := (io.ren && !io.busy)
+    val rdata = mem.read(io.raddr, (io.ren && !writeActive))
+    readDataPipe(0) := rdata
+
+    for (i <- 1 until readLatency) {
+      readpipe(i) := readpipe(i-1)
+      readDataPipe(i) := readDataPipe(i-1)
+    }
+
+    io.rdata  := readDataPipe(readLatency-1)
+    io.rvalid := readpipe(readLatency-1)
+    */
+    /*
+    when (io.wen && !busyReg && !io.ren) {
+      writepipe(0) := true.B
+      waddrPipe(0) := io.waddr
+      wdataPipe(0) := io.wdata
+      wmaskPipe(0) := io.wmask
+    }
+    .otherwise {
+      writepipe(0) := false.B
+      waddrPipe(0) := 0.U
+      wdataPipe(0) := VecInit(Seq.fill(mask_len)(0.U(w.W)))
+      wmaskPipe(0) := VecInit(Seq.fill(mask_len)(false.B))
+    }
+
+
+    for (i <- 1 until writeLatency) {
+      writepipe(i) := writepipe(i-1)
+      waddrPipe(i) := waddrPipe(i-1)
+      wdataPipe(i) := wdataPipe(i-1)
+      wmaskPipe(i) := wmaskPipe(i-1)
+    }
+
+    when (writepipe(writeLatency-1) && (waddrPipe(writeLatency-1) < n.U)) {
+    for (i <- 0 until mask_len) {
+      when (wmaskPipe(writeLatency-1)(i)) {
+        mem(waddrPipe(writeLatency-1))(i) := wdataPipe(writeLatency-1)(i)
+      }
+    }
+    }
+    */
+    //////////////////
+    ////READ LOGIC////
+    //////////////////
+    /*
+    //if we call a read and the system isn't already busy
+    when(io.ren && !busyReg && (io.raddr < n.U) && !io.wen) 
+    {
+      readpipe(0)     := true.B
+      readAddrPipe(0) := io.raddr
+      readDataPipe(0) := mem(io.raddr)
+    }
+    .otherwise 
+    {
+      readpipe(0) := false.B
+      readDataPipe(0) := VecInit(Seq.fill(mask_len)(0.U(w.W)))
+    }
+    
+    io.rdata  := readDataPipe(readLatency - 1)
+    io.rvalid := readpipe(readLatency - 1)
+
     for(i <- 1 until readLatency)
     {
         readpipe(i)     := readpipe(i-1)
-        readAddrPipe(i) := readAddrPipe(i-1)
+        //readAddrPipe(i) := readAddrPipe(i-1)
         readDataPipe(i) := readDataPipe(i-1)
     }
+    */
 
-    when(!(io.ren && !busy))
-    {
-        readpipe(0) := 0
-        readAddrPipe(0) := 0
-        readDataPipe(0) := 0 
+    /*
+    when (io.wen && !io.busy && !wreq_valid) {
+      wreq_valid := true.B
+      wreq_addr  := io.waddr
+      wreq_data  := io.wdata
+      //wreq_mask  := io.wmask.map(_.asBool)
+      wreq_mask  := io.wmask
+    }
+    
+    when (wreq_valid) {
+    writepipe(0) := true.B
+    }
+    .otherwise {
+    writepipe(0) := false.B
     }
 
-
-    //////////////////
-    ////WRITE LOGIC////
-    //////////////////
-    //if we call a read and the system isn't already busy
-    if(wren && wready)
-    {   
-        //Write 1 in the pipe to indicate that it's busy
-        //write value to memory address
-        writePipe(0)  := true.B
-        mem(io.waddr) := io.wdata
+    when (writepipe(writeLatency-1)) {
+      wreq_valid := false.B
+      for (i <- 0 until mask_len) {
+        when (wreq_mask(i)) {
+          mem(wreq_addr)(i) := wreq_data(i)
+        }
+      }
     }
 
-    //stall by making pipe run through this loop
-    //this keeps the system under the impression that it is busy writing
-    //basically just a stall to simulate behavior
     for(i <- 1 until writeLatency)
     {
         writepipe(i) := writepipe(i-1)
     }
+    */
 
-    when(!(io.wen && wready))
-    {
-        writepipe(0) := 0
-    }
-}
-
-
-
-//My version with adjusted class behavior
-class GatedDiodeMem(n: Int, w: Int, readLatency: Int, writeLatency: writeLatency)
-{
-
-    val meminst = Module(new GatedDiodeMemModule(n, w, readLatency, writeLatency))
-
-    //////////////////
-    ////READ LOGIC////
-    //////////////////
-    def read(addr: UInt, en: Bool): Uint =
-    {
-      meminst.io.ren := en
-      meminst.io.raddr := addr 
-      
-      return meminst.io.readData
-    }
-
-    //////////////////
-    ////WRITE LOGIC////
-    //////////////////
-    //if we call a read and the system isn't already busy
-    def write(addr: UInt, data: UInt): Unit = 
-    {
-      inst.io.waddr := addr
-      inst.io.wdata := data
-      inst.io.wen := true.B
-    }
-}

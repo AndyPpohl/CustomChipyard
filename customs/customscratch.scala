@@ -163,8 +163,6 @@ class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, us
   } else { // use valid only interface
     //val mem = SyncReadMem(n, Vec(mask_len, mask_elem))
     
-    //val mem = GatedDiodeMem(n, mask_elem.getWidth, mask_len, 3, 3)(this)
-
     val mem = Module(new GatedDiodeMemModule(
       n = n,
       w = mask_elem.getWidth,

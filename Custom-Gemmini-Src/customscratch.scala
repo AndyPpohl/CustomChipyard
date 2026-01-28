@@ -255,6 +255,12 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
   // id_node :=* reader.node
   // id_node :=* writer.node
 
+  ///////////////
+  //MY ADDITION//
+  ///////////////
+  val power_off = IO(Input(Bool()))  
+
+
   xbar_node := TLBuffer() := reader.node // TODO
   xbar_node := TLBuffer() := writer.node
   id_node := TLWidthWidget(config.dma_buswidth/8) := TLBuffer() := xbar_node

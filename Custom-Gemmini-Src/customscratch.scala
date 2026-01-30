@@ -162,17 +162,24 @@ class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, us
     // assert(wq.io.enq.ready || (!io.write.en), "TODO (richard): fix this if triggered")
   } else { // use valid only interface
     //val mem = SyncReadMem(n, Vec(mask_len, mask_elem))
-    
+  
+    val volatileParam: Boolean = false   // or false, or a Scala parameter
+    val confReadLatency: Int  = if (volatileParam) 1 else 4
+    val confWriteLatency: Int = if (volatileParam) 1 else 4
+
+    val volatile: Bool = volatileParam.B
+
     val mem = Module(new GatedDiodeMemModule(
       n = n,
       w = mask_elem.getWidth,
       mask_len = mask_len,
       mask_elem = mask_elem,
-      readLatency = 4,
-      writeLatency = 4
+      readLatency = 5,
+      writeLatency = 5,
+      volatile = volatile
     ))
 
-    
+    //default input values
     mem.io.rreq.valid := false.B
     mem.io.rreq.bits.addr := 0.U
     mem.io.wreq.valid := false.B
@@ -180,8 +187,100 @@ class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, us
     mem.io.wreq.bits.data := 0.U.asTypeOf(Vec(mask_len, mask_elem))
     mem.io.wreq.bits.mask := VecInit(Seq.fill(mask_len)(false.B))
 
-    val dren = io.read.req.valid
+    //add some kind of logic to basically write all existing memory back to itself 
+    //when we see the checkpoint flag go high, we will start iterating through all the addresses
+    //we'll either do that by iterating like addr+1 and only writing if it's marked as dirty
+    //or by saving every dirty write address into a matrix
+    //then iterating through that matrix, we will be perform a read on that address to a temporary regsiter
+    //the system will then perform a write on the same address, using the data in that temporary address as the write data
 
+    //When the system sees that power has come back, we'll basically do this again but in reverse
+
+    val dirty = RegInit(VecInit(Seq.fill(n)(false.B)))
+    val addr = RegInit(0.U(log2Ceil(n).W))
+    val CheckPointState = RegInit(Idle)
+
+    switch(CheckPointState) 
+    {
+      is(Idle) 
+      {
+        when(checkpoint_en) {
+          addr = 0
+          CheckPointState = Copying
+        }
+      }
+      is(ReadCopyCheck)
+      {
+        if(dirty[addr]) {
+          dirty[addr] = false.B
+          readstart = true.B
+          CheckPointState = Reading
+        }
+        else if(addr === (n-1).U) {
+          CheckPointState = Done
+        }
+        else { 
+          addr++
+          CheckPointState = ReadCopying
+        }
+      }
+      is(Reading)
+      {
+        if(readstart) {
+          //perform read operation
+          val canIssueRead = q_will_be_empty && !singleport_busy_with_write && q.io.enq.ready
+
+          mem.io.rreq.valid := (true.B) && canIssueRead //read enable input
+          mem.io.rreq.bits.addr := addr //address to read from
+        }
+        read_valid := mem.io.rresp.valid //read valid output 
+        q.io.enq.bits.data := mem.io.rresp.bits.data.asUInt //read valid input
+        mem.io.rresp.ready := true.B //read data has been received
+
+        when(read_valid){
+          writestart = true.B
+          CheckPointState = WriteCopying
+        }
+        .otherwise {
+          readstart = false.B //ensure that the read is only done once in this state on this address
+          checkpoint = Reading
+        }
+      }
+      is(WriteCopying)
+      {
+        //perform write operation on address using temporary data obtained from ReadCopying
+        if(writestart) {
+          mem.io.wreq.valid := true.B 
+          mem.io.wreq.bits.addr := addr
+          mem.io.wreq.bits.data := tempdata //data to write
+          if (aligned_to >= w) {
+            mem.io.wreq.bits.mask := VecInit(Seq.fill(mask_len)(true.B)) //write mask
+          } else {
+            mem.io.wreq.bits.mask := io.write.mask
+          }
+        }
+
+        if(mem.io.wreq.ready) { //write finished?
+          addr = addr + 1
+          CheckPointState = ReadCopying          
+        }
+        else {
+          writestart = false.B
+          CheckPointState = WriteCopying
+        }
+      }
+      is(Done)
+      {
+        checkpoint_complete = true.B
+        CheckPointState = Idle
+      }
+    }
+
+
+    
+
+    //make this all an else statement so that the checkpointing logic overwrites the reads or writes and stalls 
+    val dren = io.read.req.valid
     val effectiveRen = 
       if (single_ported) {
         assert(!(dren && io.write.fire))
@@ -190,30 +289,30 @@ class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, us
       else {
         dren
       }
-    
     val canIssueRead = q_will_be_empty && !singleport_busy_with_write && q.io.enq.ready
     
-    mem.io.rreq.valid := effectiveRen && canIssueRead
-    mem.io.rreq.bits.addr := io.read.req.bits.addr
+    mem.io.rreq.valid := effectiveRen && canIssueRead //read enable input
+    mem.io.rreq.bits.addr := io.read.req.bits.addr //address to read from
  
-    io.read.req.ready := mem.io.rreq.ready && canIssueRead
+    io.read.req.ready := mem.io.rreq.ready && canIssueRead //signal stating read has been requested
     
-    q.io.enq.valid     := mem.io.rresp.valid
-    q.io.enq.bits.data := mem.io.rresp.bits.data.asUInt
-    mem.io.rresp.ready := q.io.enq.ready
+    q.io.enq.valid     := mem.io.rresp.valid //read valid output 
+    q.io.enq.bits.data := mem.io.rresp.bits.data.asUInt //read valid input
+    mem.io.rresp.ready := q.io.enq.ready //read data has been received
 
     val fromDMA_reg = RegEnable(io.read.req.bits.fromDMA, mem.io.rreq.fire)
     q.io.enq.bits.fromDMA := RegNext(fromDMA_reg)
 
-    io.write.ready := mem.io.wreq.ready
+    io.write.ready := mem.io.wreq.ready //signal saying that the module is good to write to
 
     when(io.write.fire) {
-      mem.io.wreq.valid := true.B
-      mem.io.wreq.bits.addr := io.write.addr
-      mem.io.wreq.bits.data := io.write.data.asTypeOf(Vec(mask_len, mask_elem))
+      //dirty(io.wreq.bits.addr) := true.B //mark the written bits as dirty for nvm storing later
+      mem.io.wreq.valid := true.B //write enable basically
+      mem.io.wreq.bits.addr := io.write.addr //address to write to
+      mem.io.wreq.bits.data := io.write.data.asTypeOf(Vec(mask_len, mask_elem)) //data to write
 
       if (aligned_to >= w) {
-        mem.io.wreq.bits.mask := VecInit(Seq.fill(mask_len)(true.B))
+        mem.io.wreq.bits.mask := VecInit(Seq.fill(mask_len)(true.B)) //write mask
       } else {
         mem.io.wreq.bits.mask := io.write.mask
       }
@@ -259,7 +358,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
   //MY ADDITION//
   ///////////////
   val power_off = IO(Input(Bool()))  
-
+  //////////////////
 
   xbar_node := TLBuffer() := reader.node // TODO
   xbar_node := TLBuffer() := writer.node
@@ -950,7 +1049,9 @@ class GatedDiodeMemModule(
   val mask_len: Int,
   val mask_elem: Data,
   val readLatency: Int,
-  val writeLatency: Int
+  val writeLatency: Int,
+  //val volatile: Bool
+  //val checkpoint_en: Bool
 ) extends Module 
 {
   val addrWidth = log2Ceil(n)
@@ -973,9 +1074,12 @@ class GatedDiodeMemModule(
     }))
   })
 
-  //val mem = SyncReadMem(n, Vec(mask_len, UInt(w.W)))
   val mem = SyncReadMem(n, Vec(mask_len, mask_elem.cloneType))
-
+  //val nonvolmem = SyncReadMem(n, Vec(mask_len, mask_elem.cloneType))
+  
+  //when(checkpoint_en){
+  //  nonvolmem.write(addr,)
+  //}
 
   io.wreq.ready := true.B //accept every write for now and implement pipelining later
 
